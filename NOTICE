@@ -1,0 +1,11 @@
+Living Systems is an unofficial, server-side mod for Empyrion: Galactic Survival (Eleon Game Studios SA), developed
+against the Reforged Eden 2 scenario. It is not affiliated with or endorsed by Eleon Game Studios or the Reforged Eden
+team.
+
+This repository contains only the mod's own source code and build scripts. It contains no game files: the game's
+ModApi.dll, Mif.dll and UnityEngine.CoreModule.dll are referenced at build time from a local game install
+(EMPYRION_REFS) and are not included or redistributed. Game prefabs, configs and assets referred to by name in the
+code belong to their owners and are not included either.
+
+AI assistance: much of this code was written with Anthropic's Claude (Claude Code), directed, tested and reviewed by
+the author.

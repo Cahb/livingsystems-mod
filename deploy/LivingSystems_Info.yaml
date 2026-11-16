@@ -1,0 +1,5 @@
+Name: Living Systems
+Description: Server-side NPC traffic, comms and contracts
+Author: cahb
+Version: 0.0.1
+ModTargets: Dedi, PfServer

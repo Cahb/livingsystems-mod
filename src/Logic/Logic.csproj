@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Hot-reloadable logic (/ls reload). Every Empyrion API call lives here. -->
+  <PropertyGroup>
+    <TargetFramework>net461</TargetFramework>
+    <AssemblyName>LivingSystems.Logic</AssemblyName>
+    <MSBuildWarningsAsMessages>MSB3277</MSBuildWarningsAsMessages>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net461" Version="1.0.3" PrivateAssets="all" />
+    <!-- Core is compiled INTO the logic, not referenced: the runtime caches the first assembly per
+         identity, so a separate LivingSystems.Core.dll would never be replaced by /ls reload. -->
+    <Compile Include="../Core/**/*.cs" Exclude="../Core/obj/**;../Core/bin/**" LinkBase="Core" />
+    <ProjectReference Include="../Loader/Loader.csproj"><Private>false</Private></ProjectReference>
+    <Reference Include="ModApi"><HintPath>$(EmpyrionRefs)/ModApi.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(EmpyrionRefs)/UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Mif"><HintPath>$(EmpyrionRefs)/Mif.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>

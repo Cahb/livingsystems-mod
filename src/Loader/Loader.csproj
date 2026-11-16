@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The entry point the game loads. Kept tiny and stable: it forwards every game event to the
+       hot-reloadable logic in logic/LivingSystems.Logic.dll, so most changes need no server restart. -->
+  <PropertyGroup>
+    <TargetFramework>net461</TargetFramework>
+    <AssemblyName>LivingSystems</AssemblyName>
+    <MSBuildWarningsAsMessages>MSB3277</MSBuildWarningsAsMessages>
+    <!-- same source → same bytes, so deploy only flags a REAL loader change (it needs a server restart) -->
+    <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildProjectDirectory)=/src/Loader</PathMap>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net461" Version="1.0.3" PrivateAssets="all" />
+    <Reference Include="ModApi"><HintPath>$(EmpyrionRefs)/ModApi.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Mif"><HintPath>$(EmpyrionRefs)/Mif.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(EmpyrionRefs)/UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>
