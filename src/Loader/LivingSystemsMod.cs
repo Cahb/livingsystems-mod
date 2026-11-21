@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -23,7 +24,10 @@ namespace LivingSystems
         ModGameAPI legacy;
         ILogic logic;
         Assembly core;
-        IPlayfield currentPlayfield;
+        /// <summary>Playfields loaded on this PfServer, newest last: a reload attaches to the newest still loaded (a PfServer
+        /// can hold two — come in through a sun orbit, it unloads, the asteroid field you're in stays).</summary>
+        readonly List<IPlayfield> loadedPfs = new List<IPlayfield>();
+        IPlayfield currentPlayfield => loadedPfs.Count > 0 ? loadedPfs[loadedPfs.Count - 1] : null;
         int generation;
 
         public void Init(IModApi modApi)
@@ -43,10 +47,10 @@ namespace LivingSystems
             }
             else if (app.Mode == ApplicationMode.PlayfieldServer)
             {
-                app.OnPlayfieldLoaded += pf => { currentPlayfield = pf; Guard("loaded", () => logic?.OnPlayfieldLoaded(pf)); };
+                app.OnPlayfieldLoaded += pf => { loadedPfs.Remove(pf); loadedPfs.Add(pf); Guard("loaded", () => logic?.OnPlayfieldLoaded(pf)); };
                 // A PfServer loads the NEXT playfield before unloading the previous one (seen on a jump: load at :27,
-                // unload of the old one at :48) — only forget the current playfield if it is the one unloading.
-                app.OnPlayfieldUnloading += pf => { Guard("unloading", () => logic?.OnPlayfieldUnloading(pf)); if (ReferenceEquals(currentPlayfield, pf)) currentPlayfield = null; };
+                // unload of the old one at :48), and may keep two: drop only the one unloading.
+                app.OnPlayfieldUnloading += pf => { Guard("unloading", () => logic?.OnPlayfieldUnloading(pf)); loadedPfs.Remove(pf); };
                 app.Update += () => Guard("update", () => logic?.OnUpdate());
                 api.Network.RegisterReceiverForDediPackets((s, pf, d) =>
                 {

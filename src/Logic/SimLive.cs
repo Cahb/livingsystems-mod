@@ -25,7 +25,7 @@ namespace LivingSystems
     ///       us → Dedi  "simspawn|agent|prefab|x|y|z|yaw|name|group"  "simend|agent|how|frac"  "simhello|playfield"
     ///                  "simstations|playfield|presentBaseIds|id;name;x;y;z|…"  "simwant|agent"
     /// </summary>
-    sealed class SimLive
+    sealed partial class SimLive
     {
         readonly FlightDriver fly;
         readonly Action<string> log;
@@ -34,7 +34,9 @@ namespace LivingSystems
         sealed class Live
         {
             public string Agent = "", Kind = "";
-            public int Entity;            // 0 until spawned
+            /// <summary>Its body (the driver's record: hull, range, spawn); the ship's entity is the body's.</summary>
+            public Body B = new Body { Kind = "ship" };
+            public int Entity { get => B.Entity; set => B.Entity = value; }   // 0 until spawned
             public int Target;            // pirate: trader entity
             public Vector3 Dest;          // trader: end of its line
             public double Since, OutSince = -1;
@@ -58,6 +60,8 @@ namespace LivingSystems
             public double PatrolOrderAt = -1; // patrol: when its waypoint order was last given (re-given every 15 s)
             public string FillItem = "";  // its hold: loaded into its containers once it's there (live cargo / a pirate's loot)
             public int FillAmt;
+            /// <summary>Its whole hold ("Item:N,…"): every line goes into its crates (empty = the one FillItem line, an older Dedi).</summary>
+            public string FillHold = "";
             public int Blocks0;           // block count when first seen (hull lost live = blocks now / this)
             public float Hull = -1;
             public string Station = "", LegKind = "";
@@ -70,9 +74,15 @@ namespace LivingSystems
             public bool Passing;          // trader: crossing a stationless system on the way (transit), not leaving a station
             public Dictionary<string, string> Memory = new Dictionary<string, string>();   // memory.* from the agent (+ its hub's)
             public HashSet<int> HitBy = new HashSet<int>();
+            /// <summary>When it last called its crewmates in after being shot (at most every 10 s — hits come many a second).</summary>
+            public double LastRally = -1e9;
             /// <summary>Last "Big mistake." (once a minute: circling in and out of its leash re-started the chase every pass).</summary>
             public double LastTaunt = -1e9;
             public bool Fueled;           // tank topped up once it's there (some prefabs spawn dry and unpowered)
+            /// <summary>Pirate: stripped the hull of the trader it killed live (or gave up waiting for its record since <see cref="RobSince"/>).</summary>
+            public bool Robbed; public double RobSince = -1;
+            public Cutter Cut;            // salvage tug: its work on the current target
+            public bool HullFitted;       // the tug hull: faction / fuel / generators set (it spawns player-owned and off)
         }
 
         /// <summary>A sim trader's track this leg, as the Dedi sent it.</summary>
@@ -89,6 +99,12 @@ namespace LivingSystems
             public double T0, T1;
             public bool Live;
             public float Hull = 1;
+            /// <summary>Hub wreck: chance per minute of a ghost ping (0 = silent).</summary>
+            public double Ghost;
+            /// <summary>Salvage tug: the share of its target the sim has cut so far.</summary>
+            public float Share;
+            /// <summary>A tug's real hold the sim kept ("Item:N,…"; field 21).</summary>
+            public string Hold = "";
             public Vector3 At(double unix)
             {
                 if (T1 <= T0) return B;
@@ -105,10 +121,18 @@ namespace LivingSystems
             /// <summary>An arriving ship (Leg "arriving"): seconds until it drops out of warp.</summary>
             public double EtaSec;
             public bool IsWreck => Leg == "wreck";
+            /// <summary>A hub wreck's ghost ping (Leg "ghost"): faint, a few hundred metres off; the band keeps the last one
+            /// heard for a while (<see cref="HeardAgo"/> s ago), then it's gone.</summary>
+            public bool IsGhost => Leg == "ghost";
+            public double HeardAgo;
             /// <summary>"bulk hauler · Iron Ore 420" / "bulk hauler · empty hold"</summary>
             public string What => $"{Role} · {(Amt > 0 ? $"{Core.Sim.World.Humanize(Cargo)} {Amt}" : IsWreck ? "empty hold" : "empty hold")}";
         }
         readonly Dictionary<string, Track> traffic = new Dictionary<string, Track>();
+        /// <summary>Ghost pings each band caught (player id, or −ship id for a ship's LCD → hub wreck → where, which minute):
+        /// kept until that player / ship leaves the playfield (or the wreck goes) — a fix once taken isn't lost by flying to it.</summary>
+        sealed class HeardPing { public Vector3 Pos; public double At; }
+        readonly Dictionary<int, Dictionary<string, HeardPing>> heard = new Dictionary<int, Dictionary<string, HeardPing>>();
         readonly Dictionary<string, double> wanted = new Dictionary<string, double>();
         double nextStations;
         string lastStations = "";
@@ -118,7 +142,7 @@ namespace LivingSystems
         /// Transponders for the LCD: every sim trader with a place here — name, where it is now (the real ship if it's
         /// live), leg (out/in/dock/fight), the other system, its station.
         /// </summary>
-        public IEnumerable<Transponder> Transponders()
+        public IEnumerable<Transponder> Transponders(int pid)
         {
             var now = Unix;
             // pirates have no transponders — except hub crews while ShowHubs is on (test phase: no rumours yet to find them by)
@@ -130,6 +154,21 @@ namespace LivingSystems
                 { pos = e.Position; if (l.Hull >= 0) hull *= l.Hull; }   // live: what it had × what it's lost since
                 yield return new Transponder { Name = t.IsTrader ? t.Name + " #" + CallSign(t.Agent) : t.Name, Pos = pos, Leg = t.Leg, Other = t.Other, Station = t.Station, Hull = hull, Role = t.Role, Cargo = t.Cargo, Amt = t.Amt, AgeMin = (now - t.T0) / 60, EtaSec = t.T1 - now, Passing = t.Passing };
             }
+            // hub wrecks never show — except a ghost ping now and then (leftover power in a transponder the pirates missed);
+            // a ping this player's scan caught stays on their band (newest fix) until they leave the playfield
+            foreach (var gone in heard.Keys.Where(k => k > 0 ? Pf?.Players == null || !Pf.Players.ContainsKey(k) : Pf?.Entities == null || !Pf.Entities.ContainsKey(-k)).ToList()) heard.Remove(gone);
+            if (!heard.TryGetValue(pid, out var mine)) heard[pid] = mine = new Dictionary<string, HeardPing>();
+            foreach (var k in mine.Keys.Where(k => !traffic.TryGetValue(k, out var tr) || tr.Leg != "hubwreck").ToList()) mine.Remove(k);
+            foreach (var t in traffic.Values.Where(x => x.Leg == "hubwreck").ToList())
+            {
+                if (t.Ghost > 0 && Core.Sim.World.GhostPing(t.Agent, t.Ghost, now, out var gx, out var gy, out var gz))
+                {
+                    var slot = Math.Floor(now / 60) * 60;
+                    if (!mine.TryGetValue(t.Agent, out var h0) || h0.At != slot) mine[t.Agent] = new HeardPing { Pos = t.A + new Vector3(gx, gy, gz), At = slot };
+                }
+                if (mine.TryGetValue(t.Agent, out var h))
+                    yield return new Transponder { Name = t.Name, Pos = h.Pos, Leg = "ghost", Role = t.Role, AgeMin = (now - t.T0) / 60, HeardAgo = now - h.At };
+            }
         }
         /// <summary>A ship's transponder call sign: 4 hex digits, stable per sim agent (look-alike names stay apart).</summary>
         public static string CallSign(string agent)
@@ -139,14 +178,16 @@ namespace LivingSystems
 
         readonly Dictionary<string, Live> live = new Dictionary<string, Live>();
         double nextTick;
+        /// <summary>simhello until the Dedi answers "hellodone": sent straight from OnLoaded it beat the Dedi's own
+        /// playfield-loaded and the adopts it answered with were lost (a tug sat idle until /ls reload). As the registry's regget.</summary>
+        bool helloDone; double nextHello; int helloAsks; string helloPf = "";
 
         /// <summary>A trader is made real when a player is this close to its lane position; retired beyond <see cref="Bubble"/>.</summary>
-        const float SpawnRange = 2000f, LineLength = 6000f, Bubble = 2500f, PirateRange = 1600f;
+        const float SpawnRange = Core.Sim.BodyRules.InMetres, LineLength = 6000f, Bubble = Core.Sim.BodyRules.OutMetres, PirateRange = 1600f;
         /// <summary>Hub crews spawn when a player is this close (inside <see cref="Bubble"/>, or they would retire at once).</summary>
         const float HubRange = 2400f;
         /// <summary>Test phase: hub crews show in /ls fly where (and the LCD) so a hub can be found before rumours exist.</summary>
         const bool ShowHubs = false;   // rumours (hail → Talk) point at hubs now; on = test listing in /ls fly where + LCD
-        const double OutGrace = 20, SpawnTimeout = 90;
         /// <summary>A lurker goes for a player ship this close; gives up and goes back to its spot when the chase gets this
         /// far from the spot (can't be lured away and left out of position).</summary>
         const float Aggro = 1000f, Leash = 2000f;
@@ -209,7 +250,7 @@ namespace LivingSystems
             if (fly.GoTo(l.Entity, Wp(l.PatrolLeg), "patrol", 0f, PatrolSpeed)) l.PatrolOrderAt = fly.Now;
         }
 
-        public SimLive(FlightDriver fly, Action<string> log) { this.fly = fly; this.log = log; fly.ShipGone += OnGone; fly.Where = Where; fly.HubBearing = HubBearing; fly.SimOwns = id => wrecks.ContainsKey(id) || live.Values.Any(l => l.Entity == id); fly.Signals = Signals; fly.Wreck = WreckSpike; fly.Prefab = PrefabCmd; fly.Patrol = pid => { forcePatrol = true; fly.Say(pid, "Patrol: the next minute's roll is a yes (needs a live pirate attack here)."); }; fly.Scan = pid => { scanLeft[pid] = 5; fly.Say(pid, "Transponder scan: 5 pings."); }; fly.Remembered += OnRemembered; fly.CombatantHitBy += OnPirateHit; }
+        public SimLive(FlightDriver fly, Action<string> log) { this.fly = fly; this.log = log; AddBrain(hireBrain = new HireBrain(this)); AddBrain(shipBrain = new ShipBrain(this)); AddBrain(wreckBrain = new WreckBrain(this)); fly.ShipGone += OnGone; fly.Where = Where; fly.HubBearing = HubBearing; fly.SimOwns = id => wrecks.ContainsKey(id) || live.Values.Any(l => l.Entity == id) || bodies.Values.Any(b => b.Entity == id); fly.Signals = Signals; fly.Wreck = WreckSpike; fly.Prefab = PrefabCmd; fly.Patrol = pid => { forcePatrol = true; fly.Say(pid, "Patrol: the next minute's roll is a yes (needs a live pirate attack here)."); }; fly.Scan = pid => { scanLeft[pid] = 5; fly.Say(pid, "Transponder scan: 5 pings."); }; fly.Remembered += OnRemembered; fly.CombatantHitBy += OnPirateHit; }
 
         // ---- pirate memory ("this guy helped the trader I was after", "he killed my buddy", "I chased him") ----
         // Kept on the agent (hub crews are permanent), "killed my buddy" on the hub (every crew there, new recruits too).
@@ -258,6 +299,9 @@ namespace LivingSystems
                 }
                 log($"SIM lurker {l.Agent} shot by {pid} — goes for their ship {l.Chase}");
             }
+            // shot: its crew hears it — idle mates (resting, on patrol, flying back) join the chase on the shooter
+            if (l.Chase != 0 && !l.Pack && fly.Now - l.LastRally > 10 && Pf?.Entities != null && Pf.Entities.TryGetValue(entity, out var self) && self != null)
+            { l.LastRally = fly.Now; Rally(l, self, l.Chase); }
             if (!l.HitBy.Add(pid)) return;   // the first hit from each player counts
             var who = fly.PlayerKey(pid);
             if (l.Target != 0 && Pf?.Entities != null && Pf.Entities.TryGetValue(l.Target, out var t) && t != null)
@@ -330,6 +374,7 @@ namespace LivingSystems
             var l = live.Values.FirstOrDefault(x => x.Entity == entity && x.Kind == "trader");
             if (l == null) return null;
             traffic.TryGetValue(l.Agent, out var t);
+            if (t?.Role == "salvage tug") return null;   // tugs don't hire escorts
             var outbound = l.LegKind == "out" || (l.LegKind == "fight" && l.Bound.Length > 0);
             var value = t != null && t.Amt > 0 ? t.Amt * (Core.Sim.World.Prices.TryGetValue(t.Cargo, out var pr) ? pr : 50) : 0;
             var guns = Core.Sim.World.ShipInfo(l.Prefab)?.Strength ?? 0;
@@ -361,6 +406,8 @@ namespace LivingSystems
 
         string SaysPlain(int entity, int pid)
         {
+            var tg = live.Values.FirstOrDefault(x => x.Entity == entity && x.Kind == "tug");
+            if (tg != null) return TugSays(tg);
             var l = live.Values.FirstOrDefault(x => x.Entity == entity && x.Kind == "trader");
             if (l == null || Pf?.Entities == null || !Pf.Entities.TryGetValue(entity, out var e) || e == null) return "";
             traffic.TryGetValue(l.Agent, out var t);
@@ -373,6 +420,12 @@ namespace LivingSystems
             if (fly.Distrusts(entity, pid)) return "After last time? Where we're headed is none of your business.";
             if (fly.Escort != null && l.Memory.TryGetValue(fly.Escort.KeyFor(pid), out var mem) && mem == "abandoned")
                 return "You left us out there last time. We'll keep our route to ourselves.";
+            if (t?.Role == "salvage tug")
+            {
+                if (l.LegKind == "dock") return $"Salvage tug, docked at {l.Station}{(t.Amt > 0 ? $" — unloading {t.Amt} plates of scrap" : "")}. We go where the wrecks are.";
+                if (l.LegKind == "out") return $"Salvage tug out of {l.Station}, off to the wrecks at {(l.Bound.Length > 0 ? l.Bound : "the job")} — {left:0.0} km to the warp point.";
+                if (l.LegKind == "in") return $"Salvage tug, bringing {(t.Amt > 0 ? $"{t.Amt} plates of scrap" : "her")} home to {l.Station} — {left:0.0} km to go.";
+            }
             if (Cagey(l.Agent)) return "Minding our own business. Fly safe.";
             if (l.LegKind == "dock")
             {
@@ -420,7 +473,8 @@ namespace LivingSystems
                 if (st == null) continue;
                 ProbeSignals(p.Id, st);
                 var on = SwitchOn(st);
-                var was = scanWas.TryGetValue(p.Id, out var w) && w;
+                // the first reading only learns the state: a switch already on when you board / arrive doesn't start a scan
+                var was = scanWas.TryGetValue(p.Id, out var w) ? w : on;
                 var hailOn = SwitchOn(st, HailSignal);
                 var hailWas = hailSwitchWas.TryGetValue(p.Id, out var hw) && hw;
                 // the control panel's "all lights" switch flips our lights too: other lights coming on in the same scan
@@ -485,6 +539,7 @@ namespace LivingSystems
 
         /// <summary>Block grid y = MinPos/MaxPos y + this.</summary>
         const int GridY = 128;
+        bool planetNoted;
 
         // PROBE (2026-11-15): can the PfServer see control-panel signals? (GetSignalState / GetControlPanelSignals came back
         // empty on 2026-11-13; SignalChanged never tried.) If yes, a named signal can drive hail/scan instead of a light.
@@ -601,11 +656,25 @@ namespace LivingSystems
 
         sealed class WreckLive
         {
-            public int Entity, Cash; public string Id = "", Item = ""; public int Amt; public double Since, OutSince = -1; public bool Filled, Adopted, Prewrecked;
+            /// <summary>Its body (the driver's record); the hull is the body's entity.</summary>
+            public Body B = new Body { Kind = "wreck" };
+            public int Entity { get => B.Entity; set => B.Entity = value; }
+            public int Cash; public string Id = "", Item = ""; public int Amt; public double Since; public bool Filled, Adopted, Prewrecked;
+            /// <summary>Its whole hold ("Item:N,…", keys may carry stack data); empty = the one Item/Amt line (old Dedi).</summary>
+            public string Hold = "";
+            /// <summary>Credits still to go into a live-death hull's crates (added to its own cargo, never overwriting).</summary>
+            public int CashDue;
+            /// <summary>Been live before and cleared: its own stores are already in its hold.</summary>
+            public bool NoStores;
+            /// <summary>Its crates as last read (every 15 s once filled): what goes back on the record if the hull drops out of view.</summary>
+            public string LastHold = ""; public bool LastRead; public double ReadAt;
+            /// <summary>Share of its blocks a salvage tug has cut (spawns that far cut; kept up to date while one works).</summary>
+            public float Cut;
             /// <summary>"" = a beacon wreck (cleared when nobody comes back); "hub" = hauled to a pirate hub (kept: loot boxes,
             /// the stash goes in); "debris" = stripped hub debris (kept, empty).</summary>
             public string Mode = "";
-            public bool Keep => Mode.Length > 0;
+            /// <summary>A hub hull (stays while the sim swaps it); a spill sack is cleared like any wreck.</summary>
+            public bool Keep => Mode.Length > 0 && Mode != "spill";
         }
 
         /// <summary>
@@ -649,55 +718,66 @@ namespace LivingSystems
             return n;
         }
         readonly Dictionary<int, WreckLive> wrecks = new Dictionary<int, WreckLive>();
-        const double WreckCleanup = 300;   // nobody within the bubble this long → an unclaimed wreck is cleared
+        const double WreckCleanup = 300;   // nobody within the bubble this long → an unclaimed wreck is cleared (its hold back on the record)
 
-        void WreckTick(double now)
+        /// <summary>A live wreck, each second (its brain): its money in, its hold filled once, a gang's post kept whole. Range,
+        /// claims and dead / gone are the body driver's (<see cref="WreckBrain"/>).</summary>
+        void WreckLiveTick(WreckLive w, IEntity e, double now)
         {
-            foreach (var w in wrecks.Values.ToList())
+            var st = e.Structure;
+            if (w.CashDue > 0 && st != null && now - w.Since >= 3)
             {
-                if (!Pf.Entities.TryGetValue(w.Entity, out var e) || e == null)
-                {   // re-adopted ones may just be out of sight (Entities lists only what's near players): wait until seen
-                    if (!w.Adopted && now - w.Since > 120)
-                    {   // gone with a player right there = blown up / scrapped (never comes back); else vanished on its own
-                        var seenNear = traffic.TryGetValue(w.Id, out var tw) && fly.NearestPlayerDistance(tw.A) <= Bubble;
-                        wrecks.Remove(w.Entity); fly.Send("wreckgone", w.Entity, seenNear ? "destroyed" : "vanished");
-                    }
-                    continue;
-                }
-                w.Adopted = false;   // seen: from here on the normal rules
-                var st = e.Structure;
-                if (!w.Filled)
-                {
-                    if (st == null || now - w.Since < 3) continue;
-                    w.Filled = true;
-                    var cores = StripCore(st);
-                    splashed = 0;
-                    var holes = w.Prewrecked ? 0 : Batter(st, 0.06);   // Eden wreck hulls come chewed up already
-                    // the hold: what's left of the cargo + the ship's own stores (a little fuel, oxygen, pentaxid, cash)
-                    var all = new List<KeyValuePair<string, int>>();
-                    if (w.Amt > 0 && w.Item.Length > 0) all.Add(new KeyValuePair<string, int>(w.Item, w.Amt));
-                    if (w.Mode != "debris") all.AddRange(Stores());   // debris: stripped, nothing aboard
-                    if (w.Cash > 0 && w.Mode != "debris") all.Add(new KeyValuePair<string, int>(Core.Sim.World.Strongbox, w.Cash));   // the dead pirate's pocket / the purse that survived
-                    var tanks = w.Mode == "debris" ? "none (debris)" : Tanks(st);
-                    var layout = new List<BoxLoad>();
-                    var put = all.Count > 0 ? Hold(st, all, layout) : 0;
-                    // only crates with loot are left — except at a hub: its wrecks' crates are where the stash goes
-                    var blown = layout.Count > 0 && !w.Keep ? BlowEmpty(st, layout) : 0;
-                    if (put > 0) { var main = all[0]; refills[w.Entity] = new Refill { Entity = w.Entity, Item = main.Key, Amt = main.Value, Total = CountItem(st, main.Key), At = now, All = all, Layout = layout }; }
-                    log($"SIM wreck {w.Id} {w.Entity}{(w.Keep ? " [" + w.Mode + "]" : "")}: core(s) removed {cores}, blocks knocked off {holes}, damaged {lastSplashed}, hold {string.Join(", ", all.Select(x => $"{x.Value} {x.Key}"))} in {layout.Count} crate(s), {blown} empty crate(s) blown out; tanks {tanks}");
-                    continue;
-                }
-                // claimed: a player put a core in → theirs, we let go; unclaimed and nobody around for a while → cleared
+                var got = new List<KeyValuePair<string, int>>();
+                var n = AddInto(st, new List<KeyValuePair<string, int>> { new KeyValuePair<string, int>(Core.Sim.World.Strongbox, w.CashDue) }, got, null);
+                var put = got.Sum(x => x.Value);
+                fly.Send("wreckcashed", w.Id, put);
+                log($"SIM wreck {w.Id} {w.Entity}: {put} of {w.CashDue} {Core.Sim.World.Strongbox} into {Math.Max(0, n)} crate(s)");
+                w.CashDue = 0;
+            }
+            if (!w.Filled && w.Mode == "post")
+            {   // an active gang's listening post: theirs, whole, core in — nothing stripped, nothing aboard
+                if (st == null || now - w.Since < 3) return;
+                w.Filled = true;
+                string pc; try { pc = st.CoreType.ToString(); } catch { pc = "?"; }
+                log($"SIM wreck {w.Id} {w.Entity} [post]: pirate listening post, core {pc}{(pc == "None" ? " — the prefab has NO core: nothing guards the claim" : "")}");
+                return;
+            }
+            if (!w.Filled)
+            {
+                if (st == null || now - w.Since < 3) return;
+                w.Filled = true;
+                var cores = StripCore(st);
+                splashed = 0;
+                var holes = w.Prewrecked ? 0 : Batter(st, 0.06);   // Eden wreck hulls come chewed up already
+                if (w.Cut > 0.005f) log($"SIM wreck {w.Id}: {CutAhead(st, w.Cut)} blocks cut already ({w.Cut:P0}, a salvage tug's work)");
+                // the hold: what's left of the cargo + the ship's own stores (a little fuel, oxygen, pentaxid, cash)
+                var all = new List<KeyValuePair<string, int>>();
+                if (w.Hold.Length > 0) all.AddRange(Core.Sim.World.ParseHold(w.Hold).OrderByDescending(kv => kv.Value));   // every line it carried, biggest first
+                else if (w.Amt > 0 && w.Item.Length > 0) all.Add(new KeyValuePair<string, int>(w.Item, w.Amt));
+                if (w.Mode != "debris" && w.Mode != "chest" && w.Mode != "spill" && !w.NoStores) all.AddRange(Stores());   // debris: stripped; the strongbox: only the stash; back again: its stores are in its hold
+                if (w.Cash > 0 && w.Mode != "debris") all.Add(new KeyValuePair<string, int>(Core.Sim.World.Strongbox, w.Cash));   // the dead pirate's pocket / the purse that survived
+                var tanks = w.Mode == "debris" ? "none (debris)" : Tanks(st);
+                var layout = new List<BoxLoad>();
+                var over = new Dictionary<string, int>(StringComparer.Ordinal);
+                var put = all.Count > 0 ? Hold(st, all, layout, w.Mode == "spill" ? SackSlots : BoxSlots, over) : 0;
+                // only crates with loot are left — except at a hub: its wrecks' crates are where the stash goes; a sack's are its all
+                var blown = layout.Count > 0 && !w.Keep && w.Mode != "spill" ? BlowEmpty(st, layout) : 0;
+                if (over.Count > 0 && w.Mode != "debris" && w.Mode != "spill") SpillOut(StructureTag.Strip(e.Name), e.Position, over);   // what found no crate: sacks above it (a sack itself never spills: no cascade)
+                else if (over.Count > 0) log($"SIM wreck {w.Id}: {over.Values.Sum()} item(s) found no crate — kept on its record");
+                if (put > 0) { var main = all[0]; refills[w.Entity] = new Refill { Entity = w.Entity, Item = main.Key, Amt = main.Value, Total = CountItem(st, main.Key), At = now, All = all, Layout = layout }; }
+                log($"SIM wreck {w.Id} {w.Entity}{(w.Keep ? " [" + w.Mode + "]" : "")}: core(s) removed {cores}, blocks knocked off {holes}, damaged {lastSplashed}, hold {string.Join(", ", all.Select(x => $"{x.Value} {x.Key}"))} in {layout.Count} crate(s), {blown} empty crate(s) blown out; tanks {tanks}");
+                return;
+            }
+            if (st != null && now - w.ReadAt >= 15 && w.Mode != "post")
+            {   // what's in it now (a player may have looted it): kept for the record in case the hull drops out of view
+                w.ReadAt = now;
+                try { w.LastHold = Core.Sim.World.FormatHold(ReadHold(st)); w.LastRead = true; } catch { }
+            }
+            if (w.Mode == "post")
+            {   // the gang's post with its core shot out: a fresh copy once nobody's near (the sim brings a whole one back)
                 string core; try { core = st?.CoreType.ToString() ?? "None"; } catch { core = "None"; }
-                if (core != "None" && core != "NoFaction") { wrecks.Remove(w.Entity); fly.Send("wreckgone", w.Entity, "claimed"); log($"SIM wreck {w.Entity} claimed ({core})"); continue; }
-                if (w.Keep) continue;   // hub wrecks stay: the sim swaps them (debris, cap) while nobody's near
-                var far = fly.NearestPlayerDistance(e.Position) > Bubble;
-                if (!far) { w.OutSince = -1; continue; }
-                if (w.OutSince < 0) w.OutSince = now;
-                // the last player left the playfield: clear it NOW, while it's still loaded (a destroy sent once it's unloaded
-                // can silently fail — the hull would linger in the save); in the playfield, the 5 min grace stands
-                var empty = Pf?.Players == null || Pf.Players.Count == 0;
-                if (empty || now - w.OutSince > WreckCleanup) { fly.Retire(w.Entity); wrecks.Remove(w.Entity); fly.Send("wreckgone", w.Entity, "cleared"); log($"SIM wreck {w.Entity} cleared (nobody came back)"); }
+                if (core == "None" && fly.NearestPlayerDistance(e.Position) > HubRange + 600 && !(wanted.TryGetValue("post:" + w.Id, out var pw) && now - pw < 30))
+                { wanted["post:" + w.Id] = now; log($"SIM post {w.Entity} lost its core — a whole one comes back"); BodyBack(w.B, e, "swapped", now); }
             }
         }
 
@@ -921,20 +1001,47 @@ namespace LivingSystems
 
         /// <summary>
         /// Load <paramref name="amt"/> of an item into a structure's cargo containers with SetContent (AddItems doesn't
-        /// reach players' clients), in stacks of ≤ 500, container by container. Returns how many.
+        /// reach players' clients), in the items' own stack sizes, container by container. Returns how many.
         /// </summary>
         int Hold(IStructure st, string item, int amt) => Hold(st, new List<KeyValuePair<string, int>> { new KeyValuePair<string, int>(item, amt) });
 
         /// <summary>Several items at once (SetContent replaces a box's contents): each spread over every cargo box, biggest
-        /// first, stacks ≤ 500. Returns how many items went in.</summary>
+        /// first, in the items' own stack sizes. Returns how many items went in.</summary>
+        const int BoxSlots = 16;   // what the game keeps per crate through the API (LS_TUG: 16 of 33 written)
+        int StackOf(string item)   // the item's own stack size (MoneyCard: 50k)
+        {
+            if (item == Core.Sim.World.Strongbox) return 50000;
+            var n = Recipes()?.StackSize(item) ?? 0;
+            return n > 0 ? n : 500;
+        }
         /// <summary>Where a hold went: container position → what was written there (re-sends rewrite exactly this).</summary>
-        /// <summary>Most goods stack to 500 here; MoneyCard (credits) stacks to 50k in Eden2's ItemsConfig.</summary>
-        static int StackOf(string item) => item == Core.Sim.World.Strongbox ? 50000 : 500;
         sealed class BoxLoad { public VectorInt3 Pos; public List<ItemStack> Stacks = new List<ItemStack>(); }
 
         int Hold(IStructure st, List<KeyValuePair<string, int>> items) => Hold(st, items, null);
 
-        int Hold(IStructure st, List<KeyValuePair<string, int>> items, List<BoxLoad> layout)
+        int Hold(IStructure st, List<KeyValuePair<string, int>> items, List<BoxLoad> layout) => Hold(st, items, layout, BoxSlots, null);
+
+        const int SackSlots = Core.Sim.Spill.SackSlots;
+
+        /// <summary>
+        /// Spilled cargo: what found no crate goes out as loot sacks above <paramref name="at"/> (Core.Sim.Spill splits it), each a
+        /// sim record (World.AddSpill) spawned and filled like any wreck.
+        /// </summary>
+        void SpillOut(string source, Vector3 at, Dictionary<string, int> items)
+        {
+            var sacks = Core.Sim.Spill.Split(items, StackOf, out var lost);
+            for (var n = 0; n < sacks.Count; n++)
+            {
+                var p = at + Vector3.up * (40f + 15f * n) + Level(UnityEngine.Random.onUnitSphere) * 10f;
+                fly.Send("spill", $"{source} — spilled cargo", F(p.x), F(p.y), F(p.z), Core.Sim.World.FormatHold(sacks[n]));
+                log($"SIM spill from '{source}': sack {n + 1}, {sacks[n].Values.Sum()} item(s) in {Core.Sim.Spill.Stacks(sacks[n], StackOf)} stack(s)");
+            }
+            if (lost.Count > 0) log($"SIM spill from '{source}': over {Core.Sim.Spill.MaxSacks} sacks — lost {string.Join(", ", lost.Select(kv => kv.Value + " " + kv.Key))}");
+        }
+
+        /// <param name="slots">Stacks a crate shows (16 measured on the LS_Tug's controller; a loot sack's crate: 64).</param>
+        /// <param name="leftOut">What found no slot, by item key (null: not wanted).</param>
+        int Hold(IStructure st, List<KeyValuePair<string, int>> items, List<BoxLoad> layout, int slots, Dictionary<string, int> leftOut)
         {
             Dictionary<string, int> map; try { map = fly.Api.Application.GetBlockAndItemMapping() ?? new Dictionary<string, int>(); } catch { return 0; }
             IDevicePosList list; try { list = st.GetDevices(DeviceTypeName.Container); } catch { return 0; }
@@ -954,7 +1061,8 @@ namespace LivingSystems
             foreach (var it in items)
             {
                 if (string.IsNullOrEmpty(it.Key) || it.Value <= 0) continue;
-                if (!map.TryGetValue(it.Key, out var id)) { log($"SIM hold: no item '{it.Key}'"); continue; }
+                var baseName = Core.Sim.World.KeyBase(it.Key, out var ammo, out var decay);   // a stack with data of its own: written back exactly
+                if (!map.TryGetValue(baseName, out var id)) { log($"SIM hold: no item '{it.Key}'"); continue; }
                 var targets = new List<int>();
                 if (first) { for (var b = 0; b < Math.Min(2, boxes.Count); b++) targets.Add(b); if (boxes.Count > 2) targets.Add(2 + hr.Next(boxes.Count - 2)); }
                 else targets.Add(hr.Next(boxes.Count));
@@ -965,13 +1073,27 @@ namespace LivingSystems
                 {
                     if (left <= 0) break;
                     var mine = Math.Min(left, share);
-                    while (mine > 0 && content[b].Count < 8) { var n = Math.Min(StackOf(it.Key), mine); content[b].Add(new ItemStack { id = id, count = n, slotIdx = (byte)content[b].Count }); mine -= n; left -= n; put += n; }
+                    while (mine > 0 && content[b].Count < slots) { var n = Math.Min(StackOf(baseName), mine); content[b].Add(new ItemStack { id = id, count = n, slotIdx = (byte)content[b].Count, ammo = ammo, decay = decay }); mine -= n; left -= n; put += n; }
                 }
+                if (left > 0 && leftOut != null) leftOut[it.Key] = (leftOut.TryGetValue(it.Key, out var lo) ? lo : 0) + left;
             }
             for (var b = 0; b < boxes.Count; b++)
                 if (content[b].Count > 0)
                 {
-                    try { boxes[b].SetContent(content[b]); layout?.Add(new BoxLoad { Pos = found[b].Key, Stacks = content[b] }); }
+                    try
+                    {
+                        boxes[b].SetContent(content[b]);
+                        // what the game really kept (its own slot / volume limits): only that counts as aboard
+                        var back = boxes[b].GetContent() ?? new List<ItemStack>();
+                        var kept = back.Sum(x => x.count); var sent = content[b].Sum(x => x.count);
+                        if (kept < sent || back.Count < content[b].Count)
+                        {
+                            float vol; try { vol = boxes[b].VolumeCapacity; } catch { vol = -1; }
+                            log($"SIM hold: crate kept {back.Count} of {content[b].Count} stacks ({kept}/{sent} items), volume {vol:0}");
+                            put -= sent - kept;
+                        }
+                        layout?.Add(new BoxLoad { Pos = found[b].Key, Stacks = back });
+                    }
                     catch { put -= content[b].Sum(x => x.count); }
                 }
             return put;
@@ -983,50 +1105,107 @@ namespace LivingSystems
             foreach (var b in layout) { try { st.GetDevice<IContainer>(b.Pos)?.SetContent(b.Stacks); } catch { } }
         }
 
+        /// <summary>Items ADDED to what a hull's crates hold (topped-up stacks first, then free slots, biggest box first).
+        /// <paramref name="got"/> = what fit, <paramref name="layout"/> = every non-empty box after. Boxes touched, -1 = none.</summary>
+        int AddInto(IStructure st, List<KeyValuePair<string, int>> items, List<KeyValuePair<string, int>> got, List<BoxLoad> layout)
+        {
+            Dictionary<string, int> map; try { map = fly.Api.Application.GetBlockAndItemMapping() ?? new Dictionary<string, int>(); } catch { return -1; }
+            IDevicePosList list; try { list = st.GetDevices(DeviceTypeName.Container); } catch { return -1; }
+            var boxes = new List<KeyValuePair<VectorInt3, IContainer>>();
+            for (var i = 0; list != null && i < list.Count; i++) { try { var pos = list.GetAt(i); var c = st.GetDevice<IContainer>(pos); if (c != null) boxes.Add(new KeyValuePair<VectorInt3, IContainer>(pos, c)); } catch { } }
+            boxes = boxes.OrderByDescending(kv => { try { return kv.Value.VolumeCapacity; } catch { return 0f; } }).ToList();
+            if (boxes.Count == 0) return -1;
+            var content = boxes.Select(b => { try { return b.Value.GetContent() ?? new List<ItemStack>(); } catch { return new List<ItemStack>(); } }).ToList();
+            var touched = new HashSet<int>();
+            foreach (var it in items)
+            {
+                if (string.IsNullOrEmpty(it.Key) || it.Value <= 0) continue;
+                // "Item#ammo#decay": a stack with data of its own (a token's id, a charge, food's age) — kept apart, written exactly
+                var name = Core.Sim.World.KeyBase(it.Key, out var ammo, out var decay);
+                if (!map.TryGetValue(name, out var id)) { log($"SIM add: no item '{it.Key}'"); continue; }
+                var left = it.Value;
+                var stack = StackOf(name);
+                for (var b = 0; b < boxes.Count && left > 0; b++)
+                {
+                    var c = content[b];
+                    for (var j = 0; j < c.Count && left > 0; j++)
+                        if (c[j].id == id && c[j].ammo == ammo && c[j].decay == decay && c[j].count < stack) { var n = Math.Min(left, stack - c[j].count); var s = c[j]; s.count += n; c[j] = s; left -= n; touched.Add(b); }
+                    while (left > 0 && c.Count < BoxSlots)
+                    {
+                        byte slot = 0; while (c.Any(x => x.slotIdx == slot)) slot++;
+                        var n = Math.Min(stack, left); c.Add(new ItemStack { id = id, count = n, slotIdx = slot, ammo = ammo, decay = decay }); left -= n; touched.Add(b);
+                    }
+                }
+                if (it.Value - left > 0) got.Add(new KeyValuePair<string, int>(it.Key, it.Value - left));
+            }
+            foreach (var b in touched) { try { boxes[b].Value.SetContent(content[b]); } catch { } }
+            for (var b = 0; b < boxes.Count; b++) if (content[b].Count > 0) layout?.Add(new BoxLoad { Pos = boxes[b].Key, Stacks = content[b] });
+            return touched.Count;
+        }
+
         /// <summary>
         /// Hub loot into a hub wreck's boxes, ADDED to what's there (players may have taken some): topped-up stacks first,
         /// then free slots, biggest box first. Tells the Dedi what fit ("stashed"); the rest stays queued in the sim.
         /// </summary>
         void Stash(int entity, string hub, string[] items)
         {
-            if (!wrecks.TryGetValue(entity, out var w) || !w.Filled || w.Mode != "hub") return;
+            if (!wrecks.TryGetValue(entity, out var w) || !w.Filled || (w.Mode != "hub" && w.Mode != "chest")) return;
             if (refills.TryGetValue(entity, out var rf) && !rf.Late) return;   // the hold's own re-send first, then the stash
             if (!Pf.Entities.TryGetValue(entity, out var e) || e?.Structure == null) return;
             var st = e.Structure;
-            Dictionary<string, int> map; try { map = fly.Api.Application.GetBlockAndItemMapping() ?? new Dictionary<string, int>(); } catch { return; }
-            IDevicePosList list; try { list = st.GetDevices(DeviceTypeName.Container); } catch { return; }
-            var boxes = new List<KeyValuePair<VectorInt3, IContainer>>();
-            for (var i = 0; list != null && i < list.Count; i++) { try { var pos = list.GetAt(i); var c = st.GetDevice<IContainer>(pos); if (c != null) boxes.Add(new KeyValuePair<VectorInt3, IContainer>(pos, c)); } catch { } }
-            boxes = boxes.OrderByDescending(kv => { try { return kv.Value.VolumeCapacity; } catch { return 0f; } }).ToList();
-            if (boxes.Count == 0) { log($"SIM stash {hub} → {entity}: no boxes left"); return; }
-            var content = boxes.Select(b => { try { return b.Value.GetContent() ?? new List<ItemStack>(); } catch { return new List<ItemStack>(); } }).ToList();
-            var touched = new HashSet<int>();
-            var reply = new List<object> { "stashed", hub, entity };
-            for (var k = 0; k + 1 < items.Length; k += 2)
-            {
-                if (!int.TryParse(items[k + 1], out var amt) || amt <= 0) continue;
-                if (!map.TryGetValue(items[k], out var id)) { log($"SIM stash: no item '{items[k]}'"); continue; }
-                var left = amt;
-                var stack = StackOf(items[k]);
-                for (var b = 0; b < boxes.Count && left > 0; b++)
-                {
-                    var c = content[b];
-                    for (var j = 0; j < c.Count && left > 0; j++)
-                        if (c[j].id == id && c[j].count < stack) { var n = Math.Min(left, stack - c[j].count); var s = c[j]; s.count += n; c[j] = s; left -= n; touched.Add(b); }
-                    while (left > 0 && c.Count < 8)
-                    {
-                        byte slot = 0; while (c.Any(x => x.slotIdx == slot)) slot++;
-                        var n = Math.Min(stack, left); c.Add(new ItemStack { id = id, count = n, slotIdx = slot }); left -= n; touched.Add(b);
-                    }
-                }
-                if (amt - left > 0) { reply.Add(items[k]); reply.Add(amt - left); }
-            }
+            var want = new List<KeyValuePair<string, int>>();
+            for (var k = 0; k + 1 < items.Length; k += 2) if (int.TryParse(items[k + 1], out var amt) && amt > 0) want.Add(new KeyValuePair<string, int>(items[k], amt));
+            var got = new List<KeyValuePair<string, int>>();
             var layout = new List<BoxLoad>();
-            foreach (var b in touched) { try { boxes[b].Value.SetContent(content[b]); } catch { } }
-            for (var b = 0; b < boxes.Count; b++) if (content[b].Count > 0) layout.Add(new BoxLoad { Pos = boxes[b].Key, Stacks = content[b] });
+            var touched = AddInto(st, want, got, layout);
+            if (touched < 0) { log($"SIM stash {hub} → {entity}: no boxes left"); return; }
+            var reply = new List<object> { "stashed", hub, entity };
+            foreach (var g in got) { reply.Add(g.Key); reply.Add(g.Value); }
             if (rf != null) { rf.Layout = layout; rf.Total = CountItem(st, rf.Item); }   // later re-sends write the hold WITH the stash
             if (reply.Count > 3) fly.Send(reply.ToArray());
-            log($"SIM stash {hub} → {entity}: {string.Join(", ", reply.Skip(3))} into {touched.Count} box(es)");
+            log($"SIM stash {hub} → {entity}: {string.Join(", ", reply.Skip(3))} into {touched} box(es)");
+        }
+
+        /// <summary>A live pirate's take off the hull of the trader it killed: out of the crates (what's there of it).</summary>
+        void Robbed(int entity, string hold, string pirate)
+        {
+            if (Pf?.Entities == null || !Pf.Entities.TryGetValue(entity, out var e) || e?.Structure == null) return;
+            var want = Core.Sim.World.ParseHold(hold);
+            var took = TakeOut(e.Structure, want);
+            refills.Remove(entity);   // its crates aren't what we wrote any more: no re-send over the gap
+            SayNear(e.Position, $"{pirate} strips the wreck of {StructureTag.Strip(e.Name).Replace("Wreck of ", "")} — {string.Join(", ", want.OrderByDescending(kv => kv.Value).Take(3).Select(kv => $"{kv.Value} {Core.Sim.World.Humanize(Core.Sim.World.KeyBase(kv.Key, out _, out _))}"))} gone.");
+            log($"SIM robbed {entity}: {took} of {want.Sum(kv => kv.Value)} item(s) taken out of its crates by {pirate}");
+        }
+
+        /// <summary>Takes these items (keys with stack data matched exactly) out of a structure's containers; returns how many.</summary>
+        int TakeOut(IStructure st, Dictionary<string, int> items)
+        {
+            Dictionary<string, int> map; try { map = fly.Api.Application.GetBlockAndItemMapping() ?? new Dictionary<string, int>(); } catch { return 0; }
+            IDevicePosList list; try { list = st.GetDevices(DeviceTypeName.Container); } catch { return 0; }
+            var left = new Dictionary<string, int>(items, StringComparer.Ordinal);
+            var took = 0;
+            for (var i = 0; list != null && i < list.Count && left.Values.Any(v => v > 0); i++)
+            {
+                IContainer c; try { c = st.GetDevice<IContainer>(list.GetAt(i)); } catch { continue; }
+                if (c == null) continue;
+                List<ItemStack> content; try { content = c.GetContent() ?? new List<ItemStack>(); } catch { continue; }
+                var changed = false;
+                foreach (var key in left.Keys.ToList())
+                {
+                    var name = Core.Sim.World.KeyBase(key, out var ammo, out var decay);
+                    if (!map.TryGetValue(name, out var id)) { left[key] = 0; continue; }
+                    for (var j = content.Count - 1; j >= 0 && left[key] > 0; j--)
+                    {
+                        var s = content[j];
+                        if (s.id != id || (ammo != 0 && s.ammo != ammo) || (decay != 0 && s.decay != decay)) continue;
+                        var n = Math.Min(left[key], s.count);
+                        s.count -= n; left[key] -= n; took += n; changed = true;
+                        if (s.count <= 0) content.RemoveAt(j); else content[j] = s;
+                    }
+                }
+                if (changed) { try { c.SetContent(content); } catch { } }
+            }
+            return took;
         }
 
         /// <summary>
@@ -1084,7 +1263,36 @@ namespace LivingSystems
         {
             var cmd = args.Length > 0 ? args[0] : "next";
             if (cmd == "list") { fly.Say(pid, string.Join("\n", ProbeGroups.Select(g => $"{g.Key} ({g.Value.Length}): {string.Join(", ", g.Value)}"))); return; }
-            if (cmd == "clear") { if (probe?.Entity > 0) fly.Retire(probe.Entity); probe = null; fly.Say(pid, "Prefab probe cleared."); return; }
+            if (cmd == "clear") { if (probe?.Entity > 0) fly.Retire(probe.Entity); probe = null; spikeCut = null; fly.Say(pid, "Prefab probe cleared."); return; }
+            if (cmd == "dump") { DumpBlocks(pid, args.Skip(1).ToArray()); return; }
+            if (cmd == "cratetest") { CrateTest(pid, args.Skip(1).ToArray()); return; }
+            if (cmd == "sweepspill")
+            {   // admin: spill sacks no body owns (left when their playfield was unloaded at a clear) — gone
+                var swept = 0;
+                foreach (var e in (Pf?.Entities?.Values ?? Enumerable.Empty<IEntity>()).Where(x => x != null && (x.Name ?? "").Contains("spilled cargo") && !bodies.Values.Any(b => b.Entity == x.Id || b.Ghost == x.Id)).ToList())
+                { fly.Retire(e.Id); swept++; }
+                log($"SIM sweepspill: {swept} orphan sack(s) removed");
+                fly.Say(pid, $"sweepspill: {swept} orphan sack(s) removed");
+                return;
+            }
+            if (cmd == "spilltest")
+            {   // TEST: spill <kinds> different items (<each>, default 1) 300 m ahead of you — sacks via the sim, like any overflow
+                if (Pf?.Players == null || !Pf.Players.TryGetValue(pid, out var stp) || stp == null) return;
+                var kinds = args.Length > 1 && int.TryParse(args[1], out var k) ? Mathf.Clamp(k, 1, 400) : 20;
+                var each = args.Length > 2 && int.TryParse(args[2], out var ea) ? Mathf.Clamp(ea, 1, 100000) : 1;
+                var ship = stp.DrivingEntity; var from = ship != null ? ship.Position : stp.Position;
+                var ahead = ship != null ? ship.Forward : Vector3.forward;
+                var r = Recipes(); Dictionary<string, int> map; try { map = fly.Api.Application.GetBlockAndItemMapping() ?? new Dictionary<string, int>(); } catch { return; }
+                var items = map.Where(m => m.Value >= 8192 && r != null && !double.IsNaN(r.Volume(m.Key))).Select(m => m.Key).Distinct().Take(kinds).ToDictionary(x => x, x => each, StringComparer.Ordinal);
+                SpillOut("Script test", from + ahead * 300f, items);
+                fly.Say(pid, $"spilltest: {items.Count} kinds spilled 300 m ahead");
+                return;
+            }
+            if (cmd == "tug") { TugCmd(pid, args.Skip(1).ToArray()); return; }
+            if (cmd == "hire") { HireCmd(pid, args.Skip(1).ToArray()); return; }
+            if (cmd == "gap") { GapStart(pid, args.Skip(1).ToArray()); return; }
+            if (cmd == "beam") { BeamTest(pid, args.Skip(1).ToArray()); return; }
+            if (cmd == "salvage") { SalvageSpike(pid, args.Skip(1).ToList()); return; }   // spike: a tug cuts up the nearest «LS» wreck
             if (cmd == "dist" && args.Length > 1 && float.TryParse(args[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var dm)) { probeDist = Mathf.Clamp(dm, 10f, 2000f); fly.Say(pid, $"Prefab probe distance: {probeDist:0} m."); return; }
             string prefab;
             if (ProbeGroups.ContainsKey(cmd)) { probeGroup = cmd; probeIndex = 0; prefab = ProbeGroups[cmd][0]; }
@@ -1106,6 +1314,247 @@ namespace LivingSystems
             fly.Say(pid, $"Spawning {prefab}{n} {probeDist:0} m ahead…");
         }
 
+        /// <summary>
+        /// Voxel test: every block of a structure to Mods/LivingSystems/voxels/&lt;id&gt;_&lt;name&gt;.txt — its pose (position,
+        /// rotation, bounds) and one line per block cell "x y z type shape rot name" in the structure's own grid (y without the
+        /// +128). For the offline shell / model check. Target: an entity id, "self" (your ship), or the nearest structure.
+        /// </summary>
+        /// <summary>
+        /// TEST: what a structure's crates really keep through the API. /ls fly prefab cratetest &lt;id&gt; info | slots | volume |
+        /// mass | read | empty — slots: 40 different items, 1 each, into every crate; volume / mass: every slot a full stack of
+        /// a bulky / heavy item; read (a few s later): per crate, stacks kept, litres and kg kept vs its VolumeCapacity.
+        /// </summary>
+        void CrateTest(int pid, string[] args)
+        {
+            if (args.Length < 2 || !int.TryParse(args[0], out var eid) || Pf?.Entities == null || !Pf.Entities.TryGetValue(eid, out var e) || e?.Structure == null)
+            { fly.Say(pid, "cratetest <entity id> info|slots|volume|mass|read|empty"); return; }
+            var st = e.Structure; var mode = args[1]; var r = Recipes();
+            Dictionary<string, int> map; try { map = fly.Api.Application.GetBlockAndItemMapping() ?? new Dictionary<string, int>(); } catch { return; }
+            var names = map.GroupBy(kv => kv.Value).ToDictionary(g => g.Key, g => g.First().Key);
+            var list = st.GetDevices(DeviceTypeName.Container);
+            var boxes = new List<KeyValuePair<VectorInt3, IContainer>>();
+            for (var i = 0; list != null && i < list.Count; i++) { var p = list.GetAt(i); var c = st.GetDevice<IContainer>(p); if (c != null) boxes.Add(new KeyValuePair<VectorInt3, IContainer>(p, c)); }
+            string Item(string n) => map.ContainsKey(n) ? n : null;
+            var lines = new List<string> { $"cratetest {eid} '{StructureTag.Strip(e.Name)}' {mode}: {boxes.Count} crate(s)" };
+            foreach (var kv in boxes)
+            {
+                var c = kv.Value; float cap = 0; try { cap = c.VolumeCapacity; } catch { }
+                var at = $"{kv.Key.x},{kv.Key.y - GridY},{kv.Key.z}";
+                List<ItemStack> stacks = null;
+                switch (mode)
+                {
+                    case "slots":
+                    {
+                        var ids = map.Where(m => m.Value >= 8192 && r != null && !double.IsNaN(r.Volume(m.Key))).Select(m => m.Value).Distinct().Take(40).ToList();
+                        stacks = ids.Select((id, i) => new ItemStack { id = id, count = 1, slotIdx = (byte)i }).ToList();
+                        break;
+                    }
+                    case "volume":
+                    case "mass":
+                    {
+                        var n = Item(mode == "volume" ? "SteelPlate" : "IronOre") ?? "SteelPlate";
+                        var per = Math.Max(1, StackOf(n));
+                        stacks = Enumerable.Range(0, 40).Select(i => new ItemStack { id = map[n], count = per, slotIdx = (byte)i }).ToList();
+                        break;
+                    }
+                    case "empty": stacks = new List<ItemStack>(); break;
+                }
+                if (stacks != null) { try { c.SetContent(stacks); } catch (Exception ex) { lines.Add($"  {at}: SetContent threw {ex.Message}"); continue; } }
+                if (mode == "info" || mode == "read")
+                {
+                    List<ItemStack> got = null; try { got = c.GetContent(); } catch { }
+                    double vol = 0, kg = 0; var items = 0;
+                    foreach (var s in got ?? new List<ItemStack>())
+                    {
+                        items += s.count;
+                        if (r != null && names.TryGetValue(s.id, out var nm)) { var v = r.Volume(nm); var m = r.Mass(nm); if (!double.IsNaN(v)) vol += v * s.count; if (!double.IsNaN(m)) kg += m * s.count; }
+                    }
+                    lines.Add($"  {at}: cap {cap:N0} L — {got?.Count ?? 0} stacks, {items} items, {vol:N0} L, {kg:N0} kg");
+                }
+                else lines.Add($"  {at}: cap {cap:N0} L — wrote {stacks?.Count ?? 0} stacks ({stacks?.Sum(s => s.count) ?? 0} items)");
+            }
+            foreach (var l in lines) log("SIM " + l);
+            fly.Say(pid, string.Join("\n", lines));
+        }
+
+        void DumpBlocks(int pid, string[] args)
+        {
+            if (Pf?.Players == null || !Pf.Players.TryGetValue(pid, out var me) || me == null || Pf.Entities == null) return;
+            var from = me.DrivingEntity != null ? me.DrivingEntity.Position : me.Position;
+            IEntity e = null;
+            if (args.Length > 0 && int.TryParse(args[0], out var eid)) Pf.Entities.TryGetValue(eid, out e);
+            else if (args.Length > 0 && args[0] == "self") e = me.DrivingEntity;
+            else e = Pf.Entities.Values.Where(x => x != null && x.Structure != null && x != me.DrivingEntity && (x.Position - from).magnitude < 3000)
+                                       .OrderBy(x => (x.Position - from).magnitude).FirstOrDefault();
+            if (e?.Structure == null) { fly.Say(pid, "Dump: no structure (fly closer, or give an entity id / self)."); return; }
+            Dictionary<int, string> names = new Dictionary<int, string>();
+            try { foreach (var kv in fly.Api.Application.GetBlockAndItemMapping() ?? new Dictionary<string, int>()) names[kv.Value] = kv.Key; } catch { }
+            var inv = CultureInfo.InvariantCulture;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var st = e.Structure;
+            var sb = new System.Text.StringBuilder();
+            int cells = 0, filled = 0;
+            VectorInt3 mn, mx;
+            try { mn = st.MinPos; mx = st.MaxPos; } catch (Exception ex) { fly.Say(pid, "Dump: no bounds: " + ex.Message); return; }
+            var p = e.Position; var q = e.Rotation;
+            int count; try { count = st.BlockCount; } catch { count = -1; }
+            sb.Append("entity ").Append(e.Id).Append(" type ").Append(e.Type).Append(" name ").Append((e.Name ?? "").Replace(' ', '_')).Append('\n');
+            sb.Append(string.Format(inv, "pos {0} {1} {2}\nrot {3} {4} {5} {6}\n", p.x, p.y, p.z, q.x, q.y, q.z, q.w));
+            sb.Append(string.Format(inv, "min {0} {1} {2}\nmax {3} {4} {5}\nblockcount {6}\n", mn.x, mn.y, mn.z, mx.x, mx.y, mx.z, count));
+            sb.Append(string.Format(inv, "player {0} {1} {2}\n", from.x, from.y, from.z));
+            for (var x = mn.x; x <= mx.x; x++) for (var y = mn.y; y <= mx.y; y++) for (var z = mn.z; z <= mx.z; z++)
+            {
+                cells++;
+                int t, sh, r; bool a;
+                try { var b = st.GetBlock(x, y + GridY, z); if (b == null) continue; b.Get(out t, out sh, out r, out a); } catch { continue; }
+                if (t == 0) continue;
+                filled++;
+                sb.Append(x).Append(' ').Append(y).Append(' ').Append(z).Append(' ').Append(t).Append(' ').Append(sh).Append(' ').Append(r).Append(' ')
+                  .Append(names.TryGetValue(t, out var n) ? n : "?").Append('\n');
+            }
+            var ms = sw.ElapsedMilliseconds;
+            sb.Append(string.Format(inv, "scan {0} cells {1} filled {2} ms\n", cells, filled, ms));
+            string path;
+            try
+            {
+                var dir = System.IO.Path.Combine(fly.Api.Application.GetPathFor(AppFolder.SaveGame), "Mods", "LivingSystems", "voxels");
+                System.IO.Directory.CreateDirectory(dir);
+                var safe = new string(StructureTag.Strip(e.Name ?? "x").Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray());
+                path = System.IO.Path.Combine(dir, $"{e.Id}_{safe}.txt");
+                System.IO.File.WriteAllText(path, sb.ToString());
+            }
+            catch (Exception ex) { fly.Say(pid, "Dump: write failed: " + ex.Message); return; }
+            fly.Say(pid, $"Dump: {StructureTag.Strip(e.Name)} ({e.Id}) — {filled} filled of {cells} cells (API says {count} blocks), {ms} ms → voxels/{System.IO.Path.GetFileName(path)}");
+            log($"SIM dump {e.Id} '{e.Name}': {filled}/{cells} cells, blockcount {count}, {ms} ms → {path}");
+        }
+
+        /// <summary>Voxel test: your ship's and a target's block models, the surface gap between them read out every second.</summary>
+        sealed class GapTest { public int Pid, Ship, Target; public Core.VoxelModel Mine, Theirs; public double Until, Next; }
+        GapTest gapTest;
+
+        Core.VoxelModel ModelOf(IStructure st) => fly.ModelOf(st, true);
+        static Core.GridPose PoseOf(IStructure st) => FlightDriver.PoseOf(st);
+
+        /// <summary>Beam test: a block on a structure flipped on / off every 3 s, a few times.</summary>
+        sealed class Blink { public int Pid, Entity, Left; public VectorInt3 Pos; public double Next; public bool On; }
+        Blink beamBlink;
+
+        /// <summary>
+        /// /ls fly prefab beam — read the block named LS_BEAM on your ship (type, shape, rotation, on/off) and blink it.
+        /// /ls fly prefab beam &lt;id&gt; — copy that block onto structure &lt;id&gt;, one cell ahead of its frontmost block, and blink it.
+        /// </summary>
+        void BeamTest(int pid, string[] args)
+        {
+            if (Pf?.Players == null || !Pf.Players.TryGetValue(pid, out var me) || me?.DrivingEntity?.Structure == null || Pf.Entities == null)
+            { fly.Say(pid, "Beam test: sit in your ship (with a block named LS_BEAM) first."); return; }
+            var ship = me.DrivingEntity; var st = ship.Structure;
+            Dictionary<int, string> names = new Dictionary<int, string>();
+            try { foreach (var kv in fly.Api.Application.GetBlockAndItemMapping() ?? new Dictionary<string, int>()) names[kv.Value] = kv.Key; } catch { }
+            VectorInt3 bp; int t, sh, r; bool a;
+            try
+            {
+                var dp = st.GetDevicePositions("LS_BEAM");
+                if (dp == null || dp.Count == 0) { fly.Say(pid, "Beam test: no block named LS_BEAM on your ship."); return; }
+                bp = dp[0]; st.GetBlock(bp).Get(out t, out sh, out r, out a);
+            }
+            catch (Exception ex) { fly.Say(pid, "Beam test: reading LS_BEAM threw " + ex.Message); return; }
+            string Axis(IEntity e, IStructure s0)
+            {   // which grid axis points along the ship's nose
+                var pose = PoseOf(s0); var f = e.Forward;
+                var axes = new[] { new KeyValuePair<string, Core.Flight.Vec3>("X", pose.StepX), new KeyValuePair<string, Core.Flight.Vec3>("Y", pose.StepY), new KeyValuePair<string, Core.Flight.Vec3>("Z", pose.StepZ) };
+                var best = axes.OrderByDescending(x => Math.Abs(x.Value.X * f.x + x.Value.Y * f.y + x.Value.Z * f.z)).First();
+                var sign = best.Value.X * f.x + best.Value.Y * f.y + best.Value.Z * f.z;
+                return (sign < 0 ? "-" : "+") + best.Key;
+            }
+            var mine = $"LS_BEAM = {(names.TryGetValue(t, out var nm) ? nm : "?")} (type {t}, shape {sh}, rot {r}, {(a ? "on" : "off")}) at {bp.x},{bp.y - GridY},{bp.z}; your nose is grid {Axis(ship, st)}";
+            log("SIM beam test: " + mine);
+            if (args.Length > 0 && args[0] == "list")
+            {   // every effects block the game knows: are the beam variants separate block types?
+                var fx = names.Where(kv => kv.Value.IndexOf("Effect", StringComparison.OrdinalIgnoreCase) >= 0).OrderBy(kv => kv.Value).Select(kv => $"{kv.Value} ({kv.Key})").ToList();
+                fly.Say(pid, $"{mine}\nEffects blocks ({fx.Count}): {string.Join(", ", fx)}");
+                log("SIM beam test effects blocks: " + string.Join(", ", fx));
+                return;
+            }
+            if (args.Length == 0 || !int.TryParse(args[0], out var tid))
+            {
+                fly.Say(pid, mine + ". Blinking it 5×.");
+                beamBlink = new Blink { Pid = pid, Entity = ship.Id, Pos = bp, Left = 10, Next = fly.Now + 3, On = a };
+                return;
+            }
+            if (!Pf.Entities.TryGetValue(tid, out var te) || te?.Structure == null) { fly.Say(pid, $"Beam test: no structure {tid}."); return; }
+            var model = ModelOf(te.Structure);
+            if (model == null || model.Shell.Count == 0) { fly.Say(pid, "Beam test: couldn't read the target's blocks."); return; }
+            // the target's frontmost shell block (along its nose), then the empty cell just ahead of it
+            var tp = PoseOf(te.Structure); var fw = te.Forward;
+            var nose = model.Shell.OrderByDescending(c => { var w = tp.World(c); return w.X * fw.x + w.Y * fw.y + w.Z * fw.z; }).First();
+            var ax = Axis(te, te.Structure);
+            int dx = ax.EndsWith("X") ? 1 : 0, dy = ax.EndsWith("Y") ? 1 : 0, dz = ax.EndsWith("Z") ? 1 : 0;
+            if (ax.StartsWith("-")) { dx = -dx; dy = -dy; dz = -dz; }
+            var cell = new VectorInt3(nose.X + dx, nose.Y + dy + GridY, nose.Z + dz);
+            try
+            {
+                var b = te.Structure.GetBlock(cell);
+                if (b == null) { fly.Say(pid, "Beam test: no block handle at the target cell."); return; }
+                b.Get(out var was, out _, out _, out _);
+                b.Set(t, sh, r, true);
+                b.Get(out var now0, out var sh2, out var r2, out var a2);
+                var msg = $"Beam test: copied onto {StructureTag.Strip(te.Name)} at {cell.x},{cell.y - GridY},{cell.z} (nose {nose}, grid {ax}; cell had type {was}) → now type {now0} shape {sh2} rot {r2} {(a2 ? "on" : "off")}. Blinking it 5×.";
+                fly.Say(pid, msg); log("SIM " + msg);
+                beamBlink = new Blink { Pid = pid, Entity = te.Id, Pos = cell, Left = 10, Next = fly.Now + 3, On = true };
+            }
+            catch (Exception ex) { fly.Say(pid, "Beam test: placing threw " + ex.Message); log("SIM beam test place threw " + ex); }
+        }
+
+        void BeamBlink(double now)
+        {
+            var bl = beamBlink;
+            if (now < bl.Next) return;
+            bl.Next = now + 3;
+            try
+            {
+                if (Pf?.Entities == null || !Pf.Entities.TryGetValue(bl.Entity, out var e) || e?.Structure == null) { beamBlink = null; return; }
+                bl.On = !bl.On;
+                e.Structure.GetBlock(bl.Pos)?.Set(null, null, null, bl.On);
+                fly.Say(bl.Pid, $"beam {(bl.On ? "ON" : "off")}");
+            }
+            catch (Exception ex) { fly.Say(bl.Pid, "Beam blink threw " + ex.Message); beamBlink = null; return; }
+            if (--bl.Left <= 0) { fly.Say(bl.Pid, "Beam test done."); beamBlink = null; }
+        }
+
+        void GapStart(int pid, string[] args)
+        {
+            if (args.Length > 0 && args[0] == "off") { gapTest = null; fly.Say(pid, "Gap test off."); return; }
+            if (Pf?.Players == null || !Pf.Players.TryGetValue(pid, out var me) || me?.DrivingEntity?.Structure == null || Pf.Entities == null)
+            { fly.Say(pid, "Gap test: sit in your ship's cockpit first."); return; }
+            var ship = me.DrivingEntity;
+            IEntity e = null;
+            if (args.Length > 0 && int.TryParse(args[0], out var eid)) Pf.Entities.TryGetValue(eid, out e);
+            else e = Pf.Entities.Values.Where(x => x != null && x.Structure != null && x.Id != ship.Id && (x.Position - ship.Position).magnitude < 3000)
+                                       .OrderBy(x => (x.Position - ship.Position).magnitude).FirstOrDefault();
+            if (e?.Structure == null) { fly.Say(pid, "Gap test: no structure within 3 km (or give an entity id)."); return; }
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var mine = ModelOf(ship.Structure); var theirs = ModelOf(e.Structure);
+            if (mine == null || theirs == null) { fly.Say(pid, "Gap test: couldn't read the blocks."); return; }
+            gapTest = new GapTest { Pid = pid, Ship = ship.Id, Target = e.Id, Mine = mine, Theirs = theirs, Until = fly.Now + 120, Next = 0 };
+            fly.Say(pid, $"Gap test: you ({mine.Filled.Count} blocks, shell {mine.Shell.Count}) vs {StructureTag.Strip(e.Name)} ({theirs.Filled.Count}, shell {theirs.Shell.Count}), models in {sw.ElapsedMilliseconds} ms. Every second for 2 min (/ls fly prefab gap off).");
+        }
+
+        void GapStep(double now)
+        {
+            var g = gapTest;
+            if (now > g.Until) { fly.Say(g.Pid, "Gap test done."); gapTest = null; return; }
+            if (now < g.Next) return;
+            g.Next = now + 1;
+            if (Pf?.Entities == null || !Pf.Entities.TryGetValue(g.Ship, out var ship) || ship?.Structure == null
+                || !Pf.Entities.TryGetValue(g.Target, out var t) || t?.Structure == null) { fly.Say(g.Pid, "Gap test: lost a structure, off."); gapTest = null; return; }
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var gap = Core.VoxelModel.Gap(g.Mine, PoseOf(ship.Structure), g.Theirs, PoseOf(t.Structure), out var ca, out var cb);
+            var ms = sw.Elapsed.TotalMilliseconds;
+            var centres = (t.Position - ship.Position).magnitude;
+            fly.Say(g.Pid, $"GAP {gap:0.0} m — your {g.Mine.Filled[ca]} ({ca}) ↔ its {g.Theirs.Filled[cb]} ({cb}) · centres {centres:0} m · {ms:0.0} ms");
+        }
+
+
         void ProbeStep(double now)
         {
             var p = probe;
@@ -1122,6 +1571,20 @@ namespace LivingSystems
                 say.Add($"{p.Prefab}: {st.BlockCount} blocks, {mx.x - mn.x + 1}×{mx.y - mn.y + 1}×{mx.z - mn.z + 1} m, {e.Type}, powered={st.IsPowered}, core={st.CoreType}, shield level {st.ShieldLevel} (active={st.IsShieldActive})");
             }
             catch (Exception ex) { say.Add($"{p.Prefab}: (stats failed: {ex.GetType().Name})"); }
+            try
+            {   // where the game's "position" (the point it turns round, the HUD mark) sits against the hull's middle: an
+                // origin far off the blocks (a cut-down blueprint) makes every turn swing the hull — the flight driver fights it
+                var m = ModelOf(st);
+                if (m != null && m.Filled.Count > 0)
+                {
+                    var pose = PoseOf(st); var c0 = Vector3.zero;
+                    foreach (var cl in m.Filled.Keys) { var w = pose.World(cl); c0 += new Vector3(w.X, w.Y, w.Z); }
+                    c0 /= m.Filled.Count;
+                    var off = Quaternion.Inverse(e.Rotation) * (e.Position - c0);
+                    say.Add($"origin {off.magnitude:0.0} m from the hull's middle ({(off.z < 0 ? "behind" : "ahead")} {Math.Abs(off.z):0.0}, {(off.y < 0 ? "below" : "above")} {Math.Abs(off.y):0.0}, {(off.x < 0 ? "left" : "right")} {Math.Abs(off.x):0.0})");
+                }
+            }
+            catch { }
             // containers
             try
             {
@@ -1381,14 +1844,20 @@ namespace LivingSystems
             var facing = ship != null ? ship.Rotation : me.Rotation;
             // what matters first (a far wreck must not drop off a nearest-N list): wrecks, MAYDAYs, arrivals,
             // ships on the move, docked ones — nearest first within each
-            int Rank(Transponder t) => t.IsWreck || t.Leg == "home" ? 0 : t.Leg == "fight" ? 1 : t.Leg == "arriving" ? 2 : t.Leg == "dock" ? 4 : 3;
-            var all = Transponders().Select(t => new { t, d = t.Pos - at }).ToList();
+            int Rank(Transponder t) => t.IsWreck || t.IsGhost || t.Leg == "home" ? 0 : t.Leg == "fight" ? 1 : t.Leg == "arriving" ? 2 : t.Leg == "dock" ? 4 : 3;
+            var all = Transponders(pid).Select(t => new { t, d = t.Pos - at }).ToList();
             // compact: one short line per ship, distance + direction first; hull only
             // when hurt; destination = star + LY (no playfield code); docked ships folded into one line at the end
             var moving = all.Where(x => x.t.Leg != "dock").OrderBy(x => Rank(x.t)).ThenBy(x => x.d.magnitude).Take(max).ToList();
             var docked = all.Where(x => x.t.Leg == "dock").OrderBy(x => x.d.magnitude).ToList();
-            if (moving.Count == 0 && docked.Count == 0) { fly.Say(pid, "No transponders on the band here."); return; }
             string Dest(string o) => System.Text.RegularExpressions.Regex.Replace(o ?? "", @"\s*\([^)]*\)", "");
+            // outbound ships the last ping showed that are off the band now: they jumped — say so, don't just drop them
+            var gone = new List<string>();
+            if (lastBand.TryGetValue(pid, out var before))
+                foreach (var kv in before)
+                    if (!all.Any(x => x.t.Name == kv.Key)) gone.Add($"{kv.Key} — gone: jumped for {kv.Value}.");
+            lastBand[pid] = all.Where(x => x.t.Leg == "out" && !x.t.IsWreck && !x.t.IsGhost).GroupBy(x => x.t.Name).ToDictionary(g => g.Key, g => Dest(g.First().t.Other));
+            if (moving.Count == 0 && docked.Count == 0) { fly.Say(pid, gone.Count > 0 ? string.Join("\n", gone) + "\nNo transponders on the band here." : "No transponders on the band here."); return; }
             string Hull(Transponder t) => t.Hull < 0.95f ? $" [{t.Hull * 100:0}%]" : "";
             string Hold(Transponder t) => t.Amt > 0 ? $"{Core.Sim.World.Humanize(t.Cargo)} {t.Amt}" : "empty";
             var lines = new List<string>();
@@ -1398,6 +1867,7 @@ namespace LivingSystems
                 var t = x.t;
                 if (t.IsWreck) { lines.Add($"{where} — WRECK {t.Name} ({(t.Amt > 0 ? Hold(t) : "empty hold")}, {t.AgeMin:0} min)"); continue; }
                 if (t.Leg == "home") { lines.Add($"{where} — [test] HUB {t.Other}: {t.Name}"); continue; }
+                if (t.IsGhost) { lines.Add($"~{Math.Max(0.5, Math.Round(x.d.magnitude / 500f) / 2):0.0} km · {HailDisplay.Relative(facing, x.d)} — faint signal: {t.Name}, {t.Role} (lost {Ago(t.AgeMin)}), {Heard(t.HeardAgo)}"); continue; }
                 if (t.Leg == "arriving")
                 {
                     var eta = Math.Max(0, t.EtaSec);
@@ -1412,10 +1882,16 @@ namespace LivingSystems
             if (ship == null) lines.Add("(directions from where you look)");
             var all0 = all.Count - moving.Count - docked.Count;
             if (all0 > 0) lines.Add($"(+{all0} more on the band)");
+            lines.AddRange(gone);
             fly.Say(pid, string.Join("\n", lines));   // one message per ping, not a chat flood
         }
 
+        /// <summary>Per player: the outbound ships (name → where bound) their last ping showed — to tell them which jumped since.</summary>
+        readonly Dictionary<int, Dictionary<string, string>> lastBand = new Dictionary<int, Dictionary<string, string>>();
+
         IPlayfield Pf => fly.Playfield;
+        static string Heard(double sec) => sec < 60 ? "pinging now" : $"last heard {(int)sec / 60}:{(int)sec % 60:00} ago";
+        static string Ago(double min) => min < 90 ? $"{Math.Max(1, min):0} min ago" : min < 48 * 60 ? $"{min / 60:0} h ago" : $"{min / 1440:0} days ago";
 
         /// <summary>The system a live sim trader is bound for, or null (escort offers name it).</summary>
         public string BoundFor(int entity) { var l = live.Values.FirstOrDefault(x => x.Entity == entity); return string.IsNullOrEmpty(l?.Bound) ? null : l.Bound; }
@@ -1423,15 +1899,42 @@ namespace LivingSystems
         /// <summary>New playfield / logic reload: forget everything; the Dedi cleans up what was live here and re-sends.</summary>
         // seenStations too: PfServer processes are reused across playfields — stale stations would be reported for the next
         // playfield (phantom stations put a hub playfield on the trade network)
-        public void OnLoaded(IPlayfield p) { live.Clear(); traffic.Clear(); passAnchor.Clear(); wanted.Clear(); wrecks.Clear(); refills.Clear(); seenStations.Clear(); lastStations = ""; nextStations = 0; fly.Send("simhello", p?.Name ?? ""); }
+        /// <summary>
+        /// This process works on <paramref name="p"/> now (one PfServer can host several playfields: a newer one loaded, or
+        /// back on an older one). Every body live on the one it left goes back to the sim first — as out of range, hull kept
+        /// as its ghost, progress kept — so the sim carries it on (never frozen "live" where nobody drives it); then the
+        /// local lists start over.
+        /// </summary>
+        public void OnLoaded(IPlayfield p)
+        {
+            var name = p?.Name ?? "";
+            foreach (var b in bodies.Values.Where(x => !x.Offline && x.Playfield.Length > 0 && x.Playfield != name && !x.Brain.StaysOnSwitch(x)).ToList())
+            {
+                try { BodyBack(b, null, "range", fly.Now); log($"BODY {b.Kind} {b.Id}: its playfield '{b.Playfield}' left for '{name}' — back to the sim"); }
+                catch (Exception ex) { log($"BODY {b.Id}: back on a playfield switch threw {ex.Message}"); }
+            }
+            ResetLocal(p);
+        }
+
+        void ResetLocal(IPlayfield p) { DropShips(); DropWrecks(); traffic.Clear(); passAnchor.Clear(); wanted.Clear(); refills.Clear(); seenStations.Clear(); lastStations = ""; nextStations = 0; helloDone = false; helloAsks = 0; nextHello = -1; helloPf = p?.Name ?? ""; }
 
         public void Handle(string[] a)
         {
-            if (a.Length >= 1 && a[0] == "clear") { live.Clear(); traffic.Clear(); log("SIM live list cleared (sim reset)"); return; }
+            if (a.Length >= 1 && a[0] == "clear") { DropShips(); traffic.Clear(); log("SIM live list cleared (sim reset)"); return; }
             if (a.Length >= 1 && a[0] == "traffic") { ReadTraffic(a.Skip(1)); return; }
             if (a.Length < 2) return;
+            if (a[0] == "body") { var bm = Core.Sim.BodyMsg.Parse(a); if (bm != null) BodyHandle(bm); else log("BODY: unreadable " + string.Join("|", a)); return; }
             switch (a[0])
             {
+                case "hiretake":   // "hiretake|pid|agent|entity|name|home": a docked live tug hired where it sits
+                    if (a.Length >= 4 && int.TryParse(a[1], out var htp) && int.TryParse(a[3], out var hte)) HireTake(htp, a[2], hte, a.Length >= 5 ? a[4].Replace('_', ' ') : "Salvage tug", a.Length >= 6 ? a[5] : "");
+                    break;
+                case "hiregone":   // "hiregone|agent|entity|home": a dismissed tug, now a sim ship leaving live
+                    if (a.Length >= 3 && int.TryParse(a[2], out var hge)) HireGone(a[1], hge, a.Length >= 4 ? a[3] : "");
+                    break;
+                case "hellodone":   // the Dedi has handed back what was live here (adopts sent before this)
+                    if (a[1] == helloPf && !helloDone) { helloDone = true; log($"SIM hello answered after {helloAsks} ask(s)"); }
+                    break;
                 case "trader":
                     if (a.Length >= 4)
                     {
@@ -1440,6 +1943,7 @@ namespace LivingSystems
                             foreach (var kv in a[5].Split(';').Select(x => x.Split(new[] { '=' }, 2)).Where(x => x.Length == 2)) nl.Memory[kv[0]] = kv[1];
                         if (a.Length >= 8 && live.TryGetValue(a[1], out var cl) && int.TryParse(a[7], out var camt) && camt > 0) { cl.FillItem = a[6]; cl.FillAmt = camt; }
                         if (a.Length >= 9 && live.TryGetValue(a[1], out var sl) && float.TryParse(a[8], NumberStyles.Float, CultureInfo.InvariantCulture, out var spd) && spd > 5) sl.Cruise = spd;
+                        if (a.Length >= 10 && a[9].Length > 0 && live.TryGetValue(a[1], out var hl)) hl.FillHold = a[9];   // every line aboard (a newer Dedi)
                     }
                     break;
                 case "pirate":
@@ -1450,11 +1954,14 @@ namespace LivingSystems
                         if (a.Length >= 10 && live.TryGetValue(a[1], out var pl2) && int.TryParse(a[9], out var lamt) && lamt > 0) { pl2.FillItem = a[8]; pl2.FillAmt = lamt; }   // its loot rides along
                         if (a.Length >= 11 && live.TryGetValue(a[1], out var pm))   // what it (and its hub) remembers
                             foreach (var kv in a[10].Split(';').Select(x => x.Split(new[] { '=' }, 2)).Where(x => x.Length == 2)) pm.Memory[kv[0]] = kv[1];
+                        if (a.Length >= 12 && a[11].Length > 0 && live.TryGetValue(a[1], out var ph)) ph.FillHold = a[11];   // every loot line aboard
                     }
                     break;
-                case "wreckfill":   // a wreck hull the Dedi spawned: strip its core, knock bits off, load what's left of its hold
-                    if (a.Length >= 5 && int.TryParse(a[1], out var went) && int.TryParse(a[4], out var wamt))
-                    { wrecks[went] = new WreckLive { Entity = went, Id = a[2], Item = a[3], Amt = wamt, Since = fly.Now, Prewrecked = a.Length >= 6 && a[5] == "1", Mode = a.Length >= 7 ? a[6] : "", Cash = a.Length >= 8 && int.TryParse(a[7], out var wcash) ? wcash : 0 }; log($"SIM wreck {a[2]} = {went}: {wamt} {a[3]}{(a.Length >= 7 && a[6].Length > 0 ? " [" + a[6] + "]" : "")}"); }
+                case "tug":   // a salvage tug goes live beside its target: "tug|agent|name|prefab"
+                    if (a.Length >= 4) SpawnTug(a[1], a[2], a[3]);
+                    break;
+                case "tugleave":   // the sim says a live tug's done here: it flies out and jumps home
+                    TugLeave(a[1], a.Length >= 3 ? a[2] : "its yard", a.Length >= 4 && a[3] == "beaten");
                     break;
                 case "simdepart":   // a live pirate's rest / lurk is over: it flies out and jumps (the sim has it in warp already)
                     if (a.Length >= 2 && live.TryGetValue(a[1], out var dl) && dl.Kind == "pirate" && dl.Target == 0 && Pf?.Entities != null && Pf.Entities.TryGetValue(dl.Entity, out var de) && de != null)
@@ -1468,43 +1975,21 @@ namespace LivingSystems
                         log($"SIM pirate {dl.Agent} departs live toward {dl.Dest} (bound for {dl.Bound})");
                     }
                     break;
+                case "stripcore":   // the gang broke: its post's core out now (a coreless derelict: loot / claimable)
+                    if (int.TryParse(a[1], out var sce) && wrecks.TryGetValue(sce, out var swl) && Pf?.Entities != null && Pf.Entities.TryGetValue(sce, out var swe) && swe?.Structure != null)
+                    { swl.Mode = "hub"; var n0 = StripCore(swe.Structure); try { swe.Structure.SetFaction((FactionGroup)255, 0); } catch { } log($"SIM post {sce}: gang broken, {n0} core(s) out"); }
+                    break;
+                case "robbed":   // "robbed|entity|Item:N,…|pirate": a live pirate stripped the hull it killed — out of the crates
+                    if (a.Length >= 3 && int.TryParse(a[1], out var rbe)) Robbed(rbe, a[2], a.Length >= 4 ? a[3] : "the pirates");
+                    break;
                 case "stash":   // hub loot from the sim: "stash|entity|hub|item|amt…" → into that hub wreck's boxes, say what fit
                     if (a.Length >= 5 && int.TryParse(a[1], out var sent)) Stash(sent, a[2], a.Skip(3).ToArray());
-                    break;
-                case "wreckadopt":   // after a reload / playfield load: a wreck we spawned earlier — clean it up when nobody's near
-                    if (a.Length >= 3 && int.TryParse(a[1], out var wad) && !wrecks.ContainsKey(wad))
-                    { wrecks[wad] = new WreckLive { Entity = wad, Id = a[2], Since = fly.Now, Filled = true, Adopted = true, Mode = a.Length >= 4 ? a[3] : "" }; log($"SIM wreck {a[2]} re-adopted as {wad}"); }
-                    break;
-                case "wreck":    // spike: the Dedi spawned our test hull
-                    if (a.Length >= 2 && int.TryParse(a[1], out var pid0) && probe != null && probe.Entity == 0) { probe.Entity = pid0; probe.Since = fly.Now; log($"SIM probe: {probe.Prefab} spawned as {pid0}"); break; }
-                    if (a.Length >= 2 && int.TryParse(a[1], out var wid) && wreckTest != null) { wreckTest.Entity = wid; lastWreck = wid; wreckTest.Since = fly.Now; log($"SIM wreck spike: spawned {wid}"); }
-                    break;
-                case "attack":   // a live pirate: a trader just reached it
-                    if (a.Length >= 3 && live.TryGetValue(a[1], out var pl) && int.TryParse(a[2], out var prey)) { pl.Target = prey; pl.Steered = false; log($"SIM pirate {a[1]} attacks {prey}"); }
-                    break;
-                case "adopt":   // after a reload: a live agent we already have in the playfield; keep flying it
-                    if (a.Length >= 4 && int.TryParse(a[3], out var ent) && !live.ContainsKey(a[1]))
-                    {
-                        int.TryParse(a.Length >= 5 ? a[4] : "0", out var tgt);
-                        var nl2 = new Live { Agent = a[1], Kind = a[2], Entity = ent, Target = tgt, Since = fly.Now };
-                        // its spot (lurkers / hub crews); none sent → it holds where it is now, never the playfield origin
-                        if (a.Length >= 8 && float.TryParse(a[5], NumberStyles.Float, CultureInfo.InvariantCulture, out var sx)
-                            && float.TryParse(a[6], NumberStyles.Float, CultureInfo.InvariantCulture, out var sy) && float.TryParse(a[7], NumberStyles.Float, CultureInfo.InvariantCulture, out var sz))
-                            nl2.Dest = new Vector3(sx, sy, sz);
-                        else if (Pf?.Entities != null && Pf.Entities.TryGetValue(ent, out var here) && here != null) nl2.Dest = here.Position;
-                        if (a.Length >= 9) foreach (var kv in a[8].Split(';').Select(x => x.Split(new[] { '=' }, 2)).Where(x => x.Length == 2)) nl2.Memory[kv[0]] = kv[1];
-                        live[a[1]] = nl2;
-                        log($"SIM {a[1]} ({a[2]}) re-adopted as {ent}, spot {nl2.Dest}");
-                    }
                     break;
                 case "paid":   // a player paid this pirate off: it breaks off and leaves them alone for a while
                     if (a.Length >= 3 && int.TryParse(a[1], out var pe2) && int.TryParse(a[2], out var payer)) PaidOff(pe2, payer);
                     break;
                 case "patrolspawned":   // a station patrol we asked for is in the playfield: send it at the pirates
                     if (a.Length >= 2 && int.TryParse(a[1], out var pid2)) { patrols.Add(new PatrolShip { Entity = pid2, Since = fly.Now }); log($"SIM patrol {pid2} spawned"); }
-                    break;
-                case "spawned":
-                    if (a.Length >= 3 && live.TryGetValue(a[1], out var l) && int.TryParse(a[2], out var id)) { l.Entity = id; l.Since = fly.Now; }
                     break;
             }
         }
@@ -1539,6 +2024,7 @@ namespace LivingSystems
                     Agent = p[0], Name = p[1], Leg = p[2], A = new Vector3(G(p[3]), G(p[4]), G(p[5])) + offset, B = new Vector3(G(p[6]), G(p[7]), G(p[8])) + offset,
                     T0 = D(p[9]), T1 = D(p[10]), Live = p[11] == "1", Other = p[12], Station = p[13], Kind = p.Length > 14 ? p[14] : "trader", Hull = p.Length > 15 ? G(p[15]) : 1,
                     Role = p.Length > 16 ? p[16] : "", Cargo = p.Length > 17 ? p[17] : "", Amt = p.Length > 18 && int.TryParse(p[18], out var am) ? am : 0,
+                    Ghost = p.Length > 19 ? D(p[19]) : 0, Share = p.Length > 20 ? G(p[20]) : 0, Hold = p.Length > 21 ? p[21] : "",
                 };
             }
             foreach (var k in passAnchor.Keys.Where(k => !seen.Contains(k)).ToList()) passAnchor.Remove(k);
@@ -1637,9 +2123,9 @@ namespace LivingSystems
             // in a fight A is where it is, B where its leg goes on to; LaneA for "how far along" is only known on a leg
             var l = new Live { Agent = agent, Kind = "trader", Dest = t.B, Since = fly.Now, Bound = dest, LaneA = t.Leg == "fight" ? t.B : t.A, Station = t.Station, LegKind = t.Leg, Prefab = prefab ?? "", Passing = t.Passing };
             if (t.Leg == "dock") { l.Dest = start; l.LaneA = start; }   // parked at its berth slot
-            live[agent] = l;
+            AddShip(l);
             t.Live = true;
-            fly.Send("simspawn", agent, prefab, F(start.x), F(start.y), F(start.z), F(Yaw(heading)), StructureTag.Apply(name), TraderGroup(prefab));
+            SpawnShip(l, prefab, start, Yaw(heading), name, TraderGroup(prefab));
             log($"SIM trader {agent} '{name}' live on its {t.Leg} lane ({t.Station}): {start} → {l.Dest}");
         }
 
@@ -1680,20 +2166,37 @@ namespace LivingSystems
                           return $"{b.Id} '{b.Name}' {n} {(b.Position.magnitude / 1000f):0} km from origin"; })));
                 }
             }
+            // planets: our flight is space-only (no gravity, no ground) — a trader on a planet station's lane spawned at
+            // a flat height through the hills and stuck. Planet traffic stays in the sim until the planet milestone.
+            if (string.Equals(S(() => Pf.PlayfieldType), "Planet", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!planetNoted) { planetNoted = true; log($"SIM '{Pf.Name}' is a planet: nothing goes live here (flight is space-only)"); }
+                foreach (var l in live.Values.Where(x => x.Entity > 0 && x.Kind != "wreck").ToList())
+                {   // one that went live before this rule: off it goes (warps out; the sim carries on with it)
+                    log($"SIM {l.Agent}: live on a planet — sending it away");
+                    fly.Depart(l.Entity, "");
+                }
+                return;
+            }
             var unix = Unix;
             foreach (var t in traffic.Values)
             {
-                if (t.Kind == "wreck" && t.Station.StartsWith("swap:", StringComparison.Ordinal))
-                {   // a hub hull that's no longer what the sim says (made debris / over the cap): down while nobody's near
-                    if (!int.TryParse(t.Station.Substring(5), out var sw) || sw <= 0 || fly.NearestPlayerDistance(t.A) < HubRange + 600) continue;
+                if (t.Kind == "wreck" && (t.Station.StartsWith("swap:", StringComparison.Ordinal) || t.Station.StartsWith("swapnow:", StringComparison.Ordinal)))
+                {   // a hub hull that's no longer what the sim says (made debris / over the cap): down while nobody's near;
+                    // "swapnow" (a broken hub's junk) at once, player or not
+                    var now0 = t.Station.StartsWith("swapnow:", StringComparison.Ordinal);
+                    if (!int.TryParse(t.Station.Substring(now0 ? 8 : 5), out var sw) || sw <= 0 || (!now0 && fly.NearestPlayerDistance(t.A) < HubRange + 600)) continue;
                     if (wanted.TryGetValue("swap:" + t.Agent, out var sw0) && now - sw0 < 30) continue;
                     wanted["swap:" + t.Agent] = now;
-                    wrecks.Remove(sw); refills.Remove(sw); fly.Retire(sw);
-                    fly.Send("wreckgone", sw, "swapped");
+                    refills.Remove(sw);
+                    if (wrecks.TryGetValue(sw, out var swl)) BodyBack(swl.B, Pf.Entities.TryGetValue(sw, out var swe) ? swe : null, "swapped", now, retire: true);
+                    else { fly.Retire(sw); SendBody(Core.Sim.BodyMsg.Back("wreck", t.Agent, "swapped", false, 0, 0, 0, "", "", 0)); }
                     log($"SIM hub wreck {t.Agent} '{t.Name}' hull {sw} taken down ({t.Leg} now)");
                     continue;
                 }
-                var wants = t.Kind == "wreck" ? true : t.IsTrader ? t.Leg == "out" || t.Leg == "in" || t.Leg == "fight" || t.Leg == "dock" : t.Leg == "lurk" || t.Leg == "home" || t.Leg == "fight";
+                var wants = t.Kind == "wreck" ? true : t.IsTrader ? t.Leg == "out" || t.Leg == "in" || t.Leg == "fight" || t.Leg == "dock" || t.Leg == "salvage" : t.Leg == "lurk" || t.Leg == "home" || t.Leg == "fight";
+                // a tug goes live only beside its target's hull (which spawns by its own rule): the two as one unit
+                if (wants && t.Leg == "salvage" && !wrecks.Values.Any(x => x.Id == t.Other && x.Filled && Pf.Entities.ContainsKey(x.Entity))) wants = false;
                 if (t.Live || live.ContainsKey(t.Agent) || !wants) continue;
                 if (wanted.TryGetValue(t.Agent, out var w) && now - w < 30) continue;
                 var at = t.Pos(unix);
@@ -1710,14 +2213,14 @@ namespace LivingSystems
             }
             // crowd cap: at most MaxLiveShips ships live here (fights first, then pirates, then the nearest), at most
             // MaxDockedPerStation docked traders live per station; the rest wait in the sim and come on as slots free up
-            var ships = live.Values.Count(l => l.Kind == "trader" || l.Kind == "pirate");
-            var docked = traffic.Values.Where(x => x.Leg == "dock" && (x.Live || live.ContainsKey(x.Agent))).GroupBy(x => x.Station).ToDictionary(g => g.Key, g => g.Count());
+            var ships = live.Values.Count(l => l.Kind == "trader" || l.Kind == "pirate" || l.Kind == "tug");
+            var docked = traffic.Values.Where(x => x.Leg == "dock" && x.Role != "salvage tug" && (x.Live || live.ContainsKey(x.Agent))).GroupBy(x => x.Station).ToDictionary(g => g.Key, g => g.Count());
             var held = 0;
             foreach (var c in crowd.OrderBy(x => x.Rank).ThenBy(x => x.Dist))
             {
                 var t = c.T;
                 if (ships >= MaxLiveShips) { held++; continue; }
-                if (t.Leg == "dock") { docked.TryGetValue(t.Station, out var d); if (d >= MaxDockedPerStation) { held++; continue; } docked[t.Station] = d + 1; }
+                if (t.Leg == "dock" && t.Role != "salvage tug") { docked.TryGetValue(t.Station, out var d); if (d >= MaxDockedPerStation) { held++; continue; } docked[t.Station] = d + 1; }
                 ships++;
                 wanted[t.Agent] = now;
                 fly.Send("simwant", t.Agent);
@@ -1770,9 +2273,9 @@ namespace LivingSystems
                     var edge = Level(UnityEngine.Random.onUnitSphere); if (edge.sqrMagnitude < 0.01f) edge = Vector3.forward;
                     from = at.Value + edge * ArriveMetres;
                 }
-                live[agent] = new Live { Agent = agent, Kind = "pirate", Dest = at.Value, Since = fly.Now, Arriving = justIn };
+                var al = AddShip(new Live { Agent = agent, Kind = "pirate", Dest = at.Value, Since = fly.Now, Arriving = justIn });
                 var yaw = justIn ? Yaw(at.Value - from) : (float)(rng.NextDouble() * 360);
-                fly.Send("simspawn", agent, prefab, F(from.x), F(from.y), F(from.z), F(yaw), StructureTag.Apply(name), SpikeCommand.FactionGroup("pirates"));
+                SpawnShip(al, prefab, from, yaw, name, SpikeCommand.FactionGroup("pirates"));
                 if (justIn) SayNear(from, $"{name} dropped out of warp.");
                 log($"SIM {(justIn ? "arriving" : "lurking")} pirate {agent} '{name}' live at {from}{(justIn ? $" → its spot {at.Value}" : "")}");
                 return;
@@ -1783,8 +2286,8 @@ namespace LivingSystems
             var dir = PlayerSpot(out var pl) ? Level(pl - t.Position) : Level(UnityEngine.Random.onUnitSphere);
             dir = Quaternion.AngleAxis((float)(rng.NextDouble() * 120 - 60), Vector3.up) * dir;
             var pos = t.Position + dir * PirateRange;
-            live[agent] = new Live { Agent = agent, Kind = "pirate", Target = traderEntity, Since = fly.Now };
-            fly.Send("simspawn", agent, prefab, F(pos.x), F(pos.y), F(pos.z), F(Yaw(-dir)), StructureTag.Apply(name), SpikeCommand.FactionGroup("pirates"));
+            var pl0 = AddShip(new Live { Agent = agent, Kind = "pirate", Target = traderEntity, Since = fly.Now });
+            SpawnShip(pl0, prefab, pos, Yaw(-dir), name, SpikeCommand.FactionGroup("pirates"));
             fly.AddEvent($"Pirates closing on {StructureTag.Strip(t.Name)}");
             log($"SIM pirate {agent} '{name}' live on trader {traderEntity}");
         }
@@ -1793,151 +2296,165 @@ namespace LivingSystems
         {
             if (Pf?.Entities == null || now < nextTick) return;
             nextTick = now + 1;
+            if (!helloDone)
+            {
+                if (nextHello < 0) nextHello = now + 1;
+                else if (now >= nextHello)
+                {
+                    fly.Send("simhello", helloPf); helloAsks++; nextHello = now + (helloAsks < 30 ? 5 : 60);
+                    if (helloAsks > 1) log($"SIM hello: asking again ({helloAsks})");
+                }
+            }
             Watch(now);
-            if (wrecks.Count > 0) WreckTick(now);
             if (refills.Count > 0) Refills(now);
             if (wreckTest != null) WreckStep(now);
             if (probe != null) ProbeStep(now);
+            if (probe != null && (probe.Group == "salvage" || probe.Group == "tug")) SpikeStep(now);
+            BodyStep(now); HireIndex();
+            if (gapTest != null) GapStep(now);
+            if (beamBlink != null) BeamBlink(now);
             ScanSwitches(now);
             try { Patrols(now); } catch (Exception ex) { ShipThrew("patrols", ex); }
             try { HubPatrols(now); } catch (Exception ex) { ShipThrew("hub patrols", ex); }
-            foreach (var l in live.Values.ToList())
+        }
+
+        /// <summary>A live sim ship (trader / pirate / salvage tug), each second — its brain. The body driver has already
+        /// judged range, spawn and dead / gone (<see cref="ShipBrain"/>).</summary>
+        void ShipTick(Live l, IEntity e, double now)
+        {
+            if (l.Kind == "trader" && l.LegKind.Length == 0)
+            {   // re-adopted after a reload: no leg yet — rebuild it from the traffic list (sent right after the adopts);
+                // until then nothing may treat it as arrived
+                if (!traffic.TryGetValue(l.Agent, out var at0)) { if (now - l.Since > 60) { log($"SIM {l.Agent} re-adopted but not on the traffic list"); End(l.Agent, "left"); } return; }
+                Readopt(l, at0, e);
+            }
+            if (!l.Steered && l.Kind == "trader" && l.Dest == Vector3.zero)
+                l.Dest = e.Position + (e.Rotation * Vector3.forward) * LineLength;   // re-adopted: carry on straight ahead
+            // hull lost live = blocks now / blocks at first sight — measured only near a player: out there the game
+            // reports a near-empty structure
+            if (fly.NearestPlayerDistance(e.Position) < 2000f)
             {
-                try {   // one ship's trouble never stops the others
-                if (l.Entity == 0) { if (now - l.Since > SpawnTimeout) { log($"SIM {l.Agent} never spawned"); End(l.Agent, "left"); } continue; }
-                if (!Pf.Entities.TryGetValue(l.Entity, out var e) || e == null)
-                {
-                    if (now - l.Since > SpawnTimeout) End(l.Agent, "left");   // appeared and vanished (or never appeared)
-                    continue;
-                }
-                if (l.Kind == "trader" && l.LegKind.Length == 0)
-                {   // re-adopted after a reload: no leg yet — rebuild it from the traffic list (sent right after the adopts);
-                    // until then nothing may treat it as arrived
-                    if (!traffic.TryGetValue(l.Agent, out var at0)) { if (now - l.Since > 60) { log($"SIM {l.Agent} re-adopted but not on the traffic list"); End(l.Agent, "left"); } continue; }
-                    Readopt(l, at0, e);
-                }
-                if (!l.Steered && l.Kind == "trader" && l.Dest == Vector3.zero)
-                    l.Dest = e.Position + (e.Rotation * Vector3.forward) * LineLength;   // re-adopted: carry on straight ahead
-                // hull lost live = blocks now / blocks at first sight — measured only near a player: out there the game
-                // reports a near-empty structure
-                if (fly.NearestPlayerDistance(e.Position) < 2000f)
-                {
-                    int b = 0; try { b = e.Structure?.BlockCount ?? 0; } catch { }
-                    // a ship still loading reports -1 blocks (not a start count)
-                    if (b <= 0) { }
-                    else if (l.Blocks0 <= 0) l.Blocks0 = b;
-                    else if (b > l.Blocks0 * 0.1f) l.Hull = Mathf.Clamp01(b / (float)l.Blocks0);
-                }
-                if (!l.Scuffed && e.Structure != null && now - l.Since > 3 && fly.NearestPlayerDistance(e.Position) < 2000f)
-                {   // a ship the sim has hurt shows it: blocks at partial hp, matching its hull (fresh prefabs spawn pristine)
-                    l.Scuffed = true;
-                    var simHull = traffic.TryGetValue(l.Agent, out var ht) ? ht.Hull : 1f;
-                    if (simHull < 0.95f) log($"SIM {l.Agent} shows its damage: {Scuff(e.Structure, simHull)} blocks hurt (hull {simHull:P0})");
-                }
-                if (l.FillAmt > 0 && e.Structure != null && now - l.Since > 3)
-                {   // its cargo (or loot) in its holds, so a kill in front of you leaves something real
-                    var put = Hold(e.Structure, l.FillItem, l.FillAmt);
-                    log($"SIM {l.Agent} hold: {put} {l.FillItem}");
-                    if (put > 0) refills[l.Entity] = new Refill { Entity = l.Entity, Item = l.FillItem, Amt = l.FillAmt, Total = put, At = now };
-                    l.FillAmt = 0;
-                }
-                if (!l.Fueled && e.Structure != null) l.Fueled = Refuel(l, e);
-                if (l.Kind == "pirate") fly.MarkCombatant(l.Entity);
-                if (!l.Steered)
-                {
-                    // the ship registers with the flight driver a moment after it appears: keep trying
-                    l.Steered = l.Kind == "trader" ? fly.GoTo(l.Entity, l.Dest, l.LegKind == "in" || l.LegKind == "dock" ? l.Station : "its warp point", 0f, l.LegKind == "dock" ? 10f : l.Slow ? FinalSpeed : l.Cruise)
-                              : l.Departing ? fly.GoTo(l.Entity, l.Dest, "its warp point", 0f, 70f)
-                              : l.Patrolling ? true   // its patrol order stands (HubPatrols re-gives it)
-                              : l.Target == 0 ? fly.GoTo(l.Entity, l.Dest, "its spot", 0f, l.Arriving ? 60f : 30f)
-                              : fly.Intercept(l.Entity, l.Target, 300f);
-                    if (l.Steered && l.Kind == "trader") Announce(e);
-                    continue;
-                }
-                if (fly.Escort != null && fly.Escort.Owns(l.Entity)) continue;   // escort contract: the run owns it now
-                if (l.Kind == "trader" && Berth(l, e)) continue;
-                if (l.Kind == "pirate" && l.Target == 0 && !l.Released && !l.Departing && !l.Arriving) Lurk(l, e);
-                if (l.Arriving && (e.Position - l.Dest).magnitude < 150f) { l.Arriving = false; l.Steered = false; }   // at its spot: lurk / rest as usual
+                int b = 0; try { b = e.Structure?.BlockCount ?? 0; } catch { }
+                // a ship still loading reports -1 blocks (not a start count)
+                if (b <= 0) { }
+                else if (l.Blocks0 <= 0) l.Blocks0 = b;
+                else if (b > l.Blocks0 * 0.1f) l.Hull = Mathf.Clamp01(b / (float)l.Blocks0);
+            }
+            if (!l.Scuffed && e.Structure != null && now - l.Since > 3 && fly.NearestPlayerDistance(e.Position) < 2000f)
+            {   // a ship the sim has hurt shows it: blocks at partial hp, matching its hull (fresh prefabs spawn pristine)
+                l.Scuffed = true;
+                var simHull = traffic.TryGetValue(l.Agent, out var ht) ? ht.Hull : 1f;
+                if (simHull < 0.95f) log($"SIM {l.Agent} shows its damage: {Scuff(e.Structure, simHull)} blocks hurt (hull {simHull:P0})");
+            }
+            if ((l.FillAmt > 0 || l.FillHold.Length > 0) && e.Structure != null && now - l.Since > 3)
+            {   // its cargo (or loot) in its holds, so a kill in front of you leaves something real — every line it carries
+                var all = l.FillHold.Length > 0 ? Core.Sim.World.ParseHold(l.FillHold).OrderByDescending(kv => kv.Value).ToList()
+                                                : new List<KeyValuePair<string, int>> { new KeyValuePair<string, int>(l.FillItem, l.FillAmt) };
+                var put = all.Count > 0 ? Hold(e.Structure, all) : 0;
+                log($"SIM {l.Agent} hold: {put} item(s) of {string.Join(", ", all.Select(x => $"{x.Value} {x.Key}"))}");
+                if (put > 0 && all.Count > 0) refills[l.Entity] = new Refill { Entity = l.Entity, Item = all[0].Key, Amt = all[0].Value, Total = CountItem(e.Structure, all[0].Key), At = now, All = all };
+                l.FillAmt = 0; l.FillHold = "";
+            }
+            if (!l.Fueled && e.Structure != null) l.Fueled = Refuel(l, e);
+            if (!l.HullFitted && (l.Prefab == TugPrefab || l.Prefab.StartsWith("CV_Tugboat", StringComparison.Ordinal)) && now - l.Since > 2) l.HullFitted = FitTugHull(l, e);
+            if (l.Kind == "tug" && !l.Departing) { TugTick(l, e, now); return; }
+            if (l.Kind == "trader" && traffic.TryGetValue(l.Agent, out var tj) && tj.Role == "salvage tug" && tj.Leg == "salvage") { fly.Retire(l.Entity); End(l.Agent, "left", -1, l.Hull); return; }   // at work: its own cycle (leaving = flown like a departing pirate)
+            if (l.Kind == "pirate") fly.MarkCombatant(l.Entity);
+            if (!l.Steered)
+            {
+                // the ship registers with the flight driver a moment after it appears: keep trying
+                l.Steered = l.Kind == "trader" ? fly.GoTo(l.Entity, l.Dest, l.LegKind == "in" || l.LegKind == "dock" ? l.Station : "its warp point", 0f, l.LegKind == "dock" ? 10f : l.Slow ? FinalSpeed : l.Cruise)
+                          : l.Departing ? fly.GoTo(l.Entity, l.Dest, "its warp point", 0f, 70f)
+                          : l.Patrolling ? true   // its patrol order stands (HubPatrols re-gives it)
+                          : l.Target == 0 ? fly.GoTo(l.Entity, l.Dest, "its spot", 0f, l.Arriving ? 60f : 30f)
+                          : fly.Intercept(l.Entity, l.Target, 300f);
+                if (l.Steered && l.Kind == "trader") Announce(e);
+                return;
+            }
+            if (fly.Escort != null && fly.Escort.Owns(l.Entity)) return;   // escort contract: the run owns it now
+            if (l.Kind == "trader" && Berth(l, e)) return;
+            if (l.Kind == "pirate" && l.Target == 0 && !l.Released && !l.Departing && !l.Arriving) Lurk(l, e);
+            if (l.Arriving && (e.Position - l.Dest).magnitude < 150f) { l.Arriving = false; l.Steered = false; }   // at its spot: lurk / rest as usual
 
-                if (l.Kind == "pirate" && l.Target != 0 && !l.Released && !fly.IsFleeing(l.Entity))
+            if (l.Kind == "pirate" && l.Target != 0 && !l.Released && !fly.IsFleeing(l.Entity))
+            {
+                var preyThere = Pf.Entities.TryGetValue(l.Target, out var tgt) && tgt != null;
+                if (!preyThere || fly.IsDead(l.Target))
                 {
-                    var preyThere = Pf.Entities.TryGetValue(l.Target, out var tgt) && tgt != null;
-                    if (!preyThere || fly.IsDead(l.Target))
-                    {
-                        // another trader of ours still here (same fight, most likely)? go for that one
-                        var next = live.Values.FirstOrDefault(x => x.Kind == "trader" && x.Entity > 0 && !fly.IsDead(x.Entity) && Pf.Entities.ContainsKey(x.Entity));
-                        if (next != null) { l.Target = next.Entity; l.Steered = false; continue; }
-                        if (preyThere || fly.IsDead(l.Target)) { fly.SendAway(l.Entity); l.Released = true; }   // killed it: off it goes
-                        else if (fly.NearestPlayerDistance(e.Position) <= Bubble)
-                        {   // prey got away (jumped / went back to the sim) with a player watching: back to its spot, lurking
-                            l.Target = 0; l.Chase = 0; l.Returning = true; l.Steered = false;
-                            l.Dest = traffic.TryGetValue(l.Agent, out var pt) ? pt.A : e.Position;
-                            fly.AddEvent($"{StructureTag.Strip(e.Name)} falls back");
-                            log($"SIM pirate {l.Agent} lost its prey: back to its spot {l.Dest}");
-                            continue;
+                    // another trader of ours still here (same fight, most likely)? go for that one
+                    var next = live.Values.FirstOrDefault(x => x.Kind == "trader" && x.Entity > 0 && !fly.IsDead(x.Entity) && Pf.Entities.ContainsKey(x.Entity));
+                    if (next != null) { l.Target = next.Entity; l.Steered = false; return; }
+                    if (preyThere || fly.IsDead(l.Target))
+                    {   // killed it: strips the hull (its share of every line, as a sim kill), then off it goes
+                        if (!l.Robbed && fly.IsDead(l.Target))
+                        {
+                            if (wrecks.TryGetValue(l.Target, out var pw) && !pw.Id.StartsWith("~", StringComparison.Ordinal)) { fly.Send("simrob", l.Agent, pw.Id); l.Robbed = true; }
+                            else if (l.RobSince < 0) { l.RobSince = now; return; }   // the wreck's record is on its way from the Dedi
+                            else if (now - l.RobSince < 15) return;
+                            else l.Robbed = true;
                         }
-                        else { fly.Retire(l.Entity); End(l.Agent, "left"); continue; }   // nobody watching: the sim has it
+                        fly.SendAway(l.Entity); l.Released = true;
                     }
+                    else if (fly.NearestPlayerDistance(e.Position) <= Bubble)
+                    {   // prey got away (jumped / went back to the sim) with a player watching: back to its spot, lurking
+                        l.Target = 0; l.Chase = 0; l.Returning = true; l.Steered = false;
+                        l.Dest = traffic.TryGetValue(l.Agent, out var pt) ? pt.A : e.Position;
+                        fly.AddEvent($"{StructureTag.Strip(e.Name)} falls back");
+                        log($"SIM pirate {l.Agent} lost its prey: back to its spot {l.Dest}");
+                        return;
+                    }
+                    else { fly.Retire(l.Entity); End(l.Agent, "left"); return; }   // nobody watching: the sim has it
                 }
+            }
 
-                if (l.Kind == "trader" && l.LaneA != l.Dest)
-                {   // how far along its lane (projected), for the sim to carry on from
-                    var lane = l.Dest - l.LaneA;
-                    l.Frac = Mathf.Clamp01(Vector3.Dot(e.Position - l.LaneA, lane) / Mathf.Max(1f, lane.sqrMagnitude));
-                }
-                // inbound ships "arrive" at their berth slot (then dock, staying real); outbound at the warp point
-                if (l.Kind == "trader" && (l.LegKind == "out" || l.LegKind == "in") && l.SpoolAt < 0)
-                {   // crippled (thrusters shot off, wedged on something): it gives up on the lane and ends it where it is
-                    if (l.Stuck.Update(V(e.Position), now, Vector3.Distance(e.Position, l.Dest)))
-                    {
-                        var sn = StructureTag.Strip(e.Name);
-                        SayNear(e.Position, l.LegKind == "out" ? $"{sn}: thrusters are shot — we'll jump from right here." : $"{sn}: drives are dead — we'll hold here and dock where we are.");
-                        log($"SIM {l.Agent} stuck at {e.Position} on its {l.LegKind} leg — ends the leg in place");
-                        l.Dest = e.Position;   // "arrived": out → spools and jumps, in → docks here
-                        l.Stuck.Reset();
-                    }
-                }
-                var arrived = (l.Kind == "trader" || l.Departing) && Core.Sim.LiveRules.Arrived(l.LegKind, Vector3.Distance(e.Position, l.Dest));
-                if (arrived && l.LegKind == "in")
+            if (l.Kind == "trader" && l.LaneA != l.Dest)
+            {   // how far along its lane (projected), for the sim to carry on from
+                var lane = l.Dest - l.LaneA;
+                l.Frac = Mathf.Clamp01(Vector3.Dot(e.Position - l.LaneA, lane) / Mathf.Max(1f, lane.sqrMagnitude));
+            }
+            // inbound ships "arrive" at their berth slot (then dock, staying real); outbound at the warp point
+            if (l.Kind == "trader" && (l.LegKind == "out" || l.LegKind == "in") && l.SpoolAt < 0)
+            {   // crippled (thrusters shot off, wedged on something): it gives up on the lane and ends it where it is
+                if (l.Stuck.Update(V(e.Position), now, Vector3.Distance(e.Position, l.Dest)))
                 {
-                    l.LegKind = "dock"; l.Slow = false;
-                    fly.Send("simdock", l.Agent);
-                    Tell($"{StructureTag.Strip(e.Name)} docked at {l.Station}.", $"{StructureTag.Strip(e.Name)} docked");
-                    continue;
+                    var sn = StructureTag.Strip(e.Name);
+                    SayNear(e.Position, l.LegKind == "out" ? $"{sn}: thrusters are shot — we'll jump from right here." : $"{sn}: drives are dead — we'll hold here and dock where we are.");
+                    log($"SIM {l.Agent} stuck at {e.Position} on its {l.LegKind} leg — ends the leg in place");
+                    l.Dest = e.Position;   // "arrived": out → spools and jumps, in → docks here
+                    l.Stuck.Reset();
                 }
-                // a pirate at home / lurking / on patrol is judged by its SPOT (why it spawned), not where its ship is: a patrol
-                // orbit's far side or a short chase mustn't drop it out of the bubble and pop it back in; leaving ones go by position
-                var anchor = l.Kind == "pirate" && l.Target == 0 && !l.Departing && l.Chase == 0 ? l.Dest : e.Position;
-                var far = fly.NearestPlayerDistance(anchor) > Bubble;
-                // a pirate stays while its prey is still in someone's bubble (it's on its way in)
-                if (far && l.Kind == "pirate" && Pf.Entities.TryGetValue(l.Target, out var prey) && prey != null && fly.NearestPlayerDistance(prey.Position) <= Bubble) far = false;
-                if (far) { if (l.OutSince < 0) l.OutSince = now; } else l.OutSince = -1;
-                if (arrived && l.LegKind != "in" && l.SpoolAt < 0)
-                {   // at its warp point: hold, announce, jump in a bit (mods can't play the warp effect: telegraph it)
-                    l.SpoolAt = now;
-                    fly.GoTo(l.Entity, e.Position, "its warp point", 0f, 5f);
-                    var dest = l.Bound.Length > 0 ? l.Bound : "the next system";
-                    Tell($"{StructureTag.Strip(e.Name)} is spooling its warp drive — jumping to {dest} in {Spool:0} s.", $"{StructureTag.Strip(e.Name)} spooling");
-                    continue;
-                }
-                if (arrived && l.LegKind != "in" && now - l.SpoolAt < Spool) continue;
-                if (arrived || (far && now - l.OutSince > OutGrace))
-                {
-                    fly.Retire(l.Entity);
-                    var n = StructureTag.Strip(e.Name);
-                    if (arrived && l.LegKind == "in") Tell($"{n} docked at {l.Station}.", $"{n} docked");
-                    else if (arrived) Tell($"{n} jumped — follow it: /ls fly where shows it ARRIVING at the other end.", $"{n} jumped out");
-                    else Tell($"{n} is out of sensor range.", $"{n} out of range");
-                    End(l.Agent, l.Departing ? "left" : arrived ? "arrived" : "left", arrived ? -1 : l.Frac, l.Hull);   // a pirate is in warp already: hand it back as is
-                }
-                } catch (Exception ex) { ShipThrew(l.Agent, ex); }
+            }
+            var arrived = (l.Kind == "trader" || l.Departing) && Core.Sim.LiveRules.Arrived(l.LegKind, Vector3.Distance(e.Position, l.Dest));
+            if (arrived && l.LegKind == "in")
+            {
+                l.LegKind = "dock"; l.Slow = false;
+                fly.Send("simdock", l.Agent);
+                Tell($"{StructureTag.Strip(e.Name)} docked at {l.Station}.", $"{StructureTag.Strip(e.Name)} docked");
+                return;
+            }
+            if (arrived && l.LegKind != "in" && l.SpoolAt < 0)
+            {   // at its warp point: hold, announce, jump in a bit (mods can't play the warp effect: telegraph it)
+                l.SpoolAt = now;
+                fly.GoTo(l.Entity, e.Position, "its warp point", 0f, 5f);
+                var dest = l.Bound.Length > 0 ? l.Bound : "the next system";
+                Tell($"{StructureTag.Strip(e.Name)} is spooling its warp drive — jumping to {dest} in {Spool:0} s.", $"{StructureTag.Strip(e.Name)} spooling");
+                return;
+            }
+            if (arrived && l.LegKind != "in" && now - l.SpoolAt < Spool) return;
+            if (arrived)
+            {   // its leg's end: jumped (or docked) — the sim carries on from there
+                fly.Retire(l.Entity);
+                var n = StructureTag.Strip(e.Name);
+                if (l.LegKind == "in") Tell($"{n} docked at {l.Station}.", $"{n} docked");
+                else Tell($"{n} jumped — follow it: /ls fly where shows it ARRIVING at the other end.", $"{n} jumped out");
+                End(l.Agent, l.Departing ? "left" : "arrived", -1, l.Hull);   // a pirate is in warp already: hand it back as is
             }
         }
 
         const float FinalApproach = 600f, FinalSpeed = 8f;
         /// <summary>Pirates leaving fly this far out before they spool and jump; a crew in from warp within
         /// <see cref="ArriveWindow"/> s drops out this far from its spot and flies in.</summary>
-        const float DepartMetres = 5000f, ArriveMetres = 3500f;
+        const float DepartMetres = 5000f, ArriveMetres = 1500f;   // arrivals inside the players' physics range (≈3.5 km out froze as a proxy)
         const double ArriveWindow = 90;
         const double Spool = 10;
 
@@ -2119,36 +2636,7 @@ namespace LivingSystems
 
         void OnGone(int entity, string how)
         {
-            var l = live.Values.FirstOrDefault(x => x.Entity == entity);
-            if (l == null) return;
-            if (how == "dead")
-            {
-                // the hull stays, coreless, with whatever is in its holds — a wreck (beacon + cleanup), pirates too
-                if (Pf?.Entities != null && Pf.Entities.TryGetValue(entity, out var he) && he != null)
-                {
-                    fly.Send("wreckfromlive", l.Agent, entity, F(he.Position.x), F(he.Position.y), F(he.Position.z));
-                    wrecks[entity] = new WreckLive { Entity = entity, Since = fly.Now, Filled = true };
-                }
-                // a pirate killed by players: its crew remembers who (kept on its hub — new recruits inherit the grudge)
-                if (l.Kind == "pirate")
-                    foreach (var pid in l.HitBy) fly.Send("simmem", l.Agent, "memory.killed." + fly.PlayerKey(pid), StructureTag.Strip(Pf?.Entities != null && Pf.Entities.TryGetValue(entity, out var pe) && pe != null ? pe.Name : l.Agent));
-                End(l.Agent, "dead");
-            }
-            else if (how == "jumped")
-                // escorted traders: the run's Dedi side adopts them mid-warp; a trader that fled on its own really left the
-                // system — the sim sends it on (was "left": it stayed docked in the sim where it had fled from)
-                End(l.Agent, l.Kind == "pirate" ? (l.Released ? "jumped" : "fled") : fly.Escort != null && fly.Escort.Owns(entity) ? "left" : "jumped");
-            else if (how == "lost") { fly.Retire(entity); End(l.Agent, "left", l.Frac, l.Hull); }   // went proxy: out of range, still alive — remove the proxy, the sim has it
-            else End(l.Agent, "claimed");   // a player cored it: theirs now, the sim lets go for good
-        }
-
-        void End(string agent, string how, float frac = -1, float hull = -1)
-        {
-            live.Remove(agent);
-            if (traffic.TryGetValue(agent, out var t)) t.Live = false;
-            wanted[agent] = fly.Now;   // don't ask for it again right away (the Dedi re-sends its track first)
-            fly.Send("simend", agent, how, frac.ToString("0.###", CultureInfo.InvariantCulture), hull.ToString("0.###", CultureInfo.InvariantCulture));
-            log($"SIM {agent} back to the sim: {how}");
+            BodyGone(entity, how);   // every sim ship is a body: the driver judges dead / claimed / gone
         }
 
         bool PlayerSpot(out Vector3 at)

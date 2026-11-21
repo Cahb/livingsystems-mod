@@ -34,6 +34,7 @@ namespace LivingSystems
             return pfGalaxy;
         }
         DediSim sim;
+        DediScript script;
         HailDisplay lcd;
         SimLive simLive;
 
@@ -56,10 +57,12 @@ namespace LivingSystems
 
             if (api.Application.Mode == ApplicationMode.DedicatedServer) { registry = new DediRegistry(api, log); dedi = new DediSpike(api, log); dedi.OnSpawned = registry.RegisterSpawn; dedi.OnDestroyed = registry.Forget;
                 if (legacy != null) dedi.AttachLegacy(legacy);
-                try { sim = new DediSim(api, log, dedi); registry.OnDeparted = sim.OnDeparted; dedi.OnSim = (pid, cmd) => sim.Command(pid, cmd, dedi.Say); dedi.TalkFor = sim.Talk; dedi.ShipDealFor = sim.ShipDeal; dedi.TradeLineFor = sim.TradeLine; dedi.TollFor = sim.PirateToll; dedi.TollPaid = sim.TollPaid; dedi.BountyFor = sim.BountyOfferText; dedi.AcceptBountyFor = sim.AcceptBounty; dedi.CollectFor = sim.CollectBounties; }
+                try { sim = new DediSim(api, log, dedi); registry.OnDeparted = sim.OnDeparted; dedi.OnSim = (pid, cmd) => sim.Command(pid, cmd, dedi.Say); dedi.TopicsFor = sim.TalkTopics; dedi.TugOffersFor = sim.TugOffers; dedi.HireTugFor = sim.HireTug; dedi.HireEndFor = sim.HireEnd; dedi.HireDismissOffline = sim.DismissOffline; dedi.HireIsOffline = sim.HireIsOffline; dedi.HireShareFor = sim.HireShare; dedi.HireClockFor = sim.HireClockLine; dedi.ShipDealFor = sim.ShipDeal; dedi.TradeLineFor = sim.TradeLine; dedi.TollFor = sim.PirateToll; dedi.TollPaid = sim.TollPaid; dedi.BountyFor = sim.BountyOfferText; dedi.AcceptBountyFor = sim.AcceptBounty; dedi.CollectFor = sim.CollectBounties; }
                 catch (Exception e) { log("sim failed to start: " + e); }
+                // test harness: script.in in the save (see DediScript / tests/live)
+                try { script = new DediScript(api, dedi, log, log); } catch (Exception e) { log("script runner failed to start: " + e); }
             }
-            else if (api.Application.Mode == ApplicationMode.PlayfieldServer) { pf = new PfSpike(api, log); fly = new FlightDriver(api, log); fly.Escort = new EscortRun(fly, log); simLive = new SimLive(fly, log); simLive.OnHail = pf.Hail; fly.Escort.BoundFor = simLive.BoundFor; fly.Escort.Memory = simLive.MemoryOf; fly.Escort.WarpPointFor = simLive.WarpPointOf; fly.Escort.AskFor = simLive.EscortAskOf; pf.ShipStatus = fly.StatusOf; pf.ShipSays = simLive.Says; pf.IsOurShip = fly.IsOurs; pf.FeedEvent = fly.AddEvent; lcd = new HailDisplay(log, fly) { Traffic = simLive.Transponders, GalaxyFor = PfGalaxy }; if (playfield != null) { loadedPfs.Add(playfield); attached = playfield; pf.OnLoaded(playfield); fly.OnLoaded(playfield); lcd.OnLoaded(playfield); simLive.OnLoaded(playfield); } }
+            else if (api.Application.Mode == ApplicationMode.PlayfieldServer) { pf = new PfSpike(api, log); fly = new FlightDriver(api, log); fly.Escort = new EscortRun(fly, log); simLive = new SimLive(fly, log); simLive.OnHail = pf.Hail; fly.Escort.BoundFor = simLive.BoundFor; fly.Escort.Memory = simLive.MemoryOf; fly.Escort.WarpPointFor = simLive.WarpPointOf; fly.Escort.AskFor = simLive.EscortAskOf; pf.ShipStatus = fly.StatusOf; pf.ShipSays = simLive.Says; pf.IsOurShip = fly.IsOurs; pf.HiredTugOf = simLive.HiredTugOf; pf.FeedEvent = fly.AddEvent; lcd = new HailDisplay(log, fly) { Traffic = simLive.Transponders, GalaxyFor = PfGalaxy }; if (playfield != null) { loadedPfs.Add(playfield); attached = playfield; pf.OnLoaded(playfield); fly.OnLoaded(playfield); lcd.OnLoaded(playfield); simLive.OnLoaded(playfield); } }
         }
 
         /// <summary>"pid|fly|args..." goes to the flight driver; everything else to the spike.</summary>
@@ -82,11 +85,19 @@ namespace LivingSystems
             fly?.Stop(); pf?.Stop(); dedi?.Stop(); log?.Invoke("logic stop");
         }
 
-        public void OnLegacyEvent(CmdId id, ushort seqNr, object data) { dedi?.OnUpdate(); dedi?.OnLegacyEvent(id, seqNr, data); }
+        public void OnLegacyEvent(CmdId id, ushort seqNr, object data)
+        {
+            dedi?.OnUpdate();
+            try { script?.OnLegacyEvent(id, seqNr, data); } catch (Exception e) { log("script ack threw: " + e.Message); }
+            dedi?.OnLegacyEvent(id, seqNr, data);
+            PumpScript();   // last: "ls reload" replaces this instance
+        }
+        void PumpScript() { try { script?.Pump(); } catch (Exception e) { Throttled("script pump", e); } }
         public void OnChat(MessageData m) => dedi?.OnChat(m);
         public void OnUpdate()
         {
             pf?.OnUpdate();
+            PokeScript();
             dedi?.OnUpdate();
             // separate guards: a fault in one system doesn't stop the others (it used to stop ALL flight until a reload)
             try { fly?.OnUpdate(); } catch (Exception e) { Throttled("fly update", e); }
@@ -94,6 +105,22 @@ namespace LivingSystems
             try { if (fly != null) simLive?.Tick(fly.Now); } catch (Exception e) { Throttled("sim live tick", e); }
             try { if (fly != null) lcd?.OnUpdate(fly.Now); } catch (Exception e) { log("lcd update threw: " + e.Message); }
         }
+        // PfServer: while a test script waits in the save, nudge the Dedi once a second (it has no frame update of its own)
+        DateTime nextPoke; string scriptIn;
+        void PokeScript()
+        {
+            if (pf == null || attached == null) return;
+            var now = DateTime.UtcNow;
+            if (now < nextPoke) return;
+            nextPoke = now.AddSeconds(1);
+            try
+            {
+                if (scriptIn == null) scriptIn = DediScript.InPath(api);
+                if (System.IO.File.Exists(scriptIn)) api.Network.SendToDedicatedServer(LivingSystemsMod.Channel, Wire.Pack("scriptpoke"), attached.Name);
+            }
+            catch (Exception e) { Throttled("script poke", e); }
+        }
+
         readonly Dictionary<string, DateTime> threw = new Dictionary<string, DateTime>();
         void Throttled(string what, Exception e)
         {
@@ -125,7 +152,15 @@ namespace LivingSystems
         public void OnPacket(string sender, string playfieldName, byte[] data)
         {
             dedi?.OnUpdate();   // the Dedi has no frame update: delayed work runs off incoming traffic (≤ ~15 s)
-            if (dedi != null && sim != null && Wire.IsOurs(sender))
+            if (dedi != null) { try { OnDediPacket(sender, playfieldName, data); } finally { PumpScript(); } }   // script last: "ls reload" replaces this instance
+            else if (fly != null && TryFly(sender, data)) { }
+            else pf?.OnPacket(sender, playfieldName, data);
+        }
+
+        void OnDediPacket(string sender, string playfieldName, byte[] data)
+        {
+            if (Wire.IsOurs(sender) && data != null && data.Length == 11 && Wire.Unpack(data)[0] == "scriptpoke") return;   // only wakes PumpScript
+            if (sim != null && Wire.IsOurs(sender))
             {
                 var f = Wire.Unpack(data);
                 try
@@ -135,9 +170,7 @@ namespace LivingSystems
                 }
                 catch (Exception e) { log("sim packet threw: " + e); return; }
             }
-            if (dedi != null) { if (registry == null || !registry.TryHandle(sender, playfieldName, data)) dedi.OnPacket(sender, playfieldName, data); }
-            else if (fly != null && TryFly(sender, data)) { }
-            else pf?.OnPacket(sender, playfieldName, data);
+            if (registry == null || !registry.TryHandle(sender, playfieldName, data)) dedi.OnPacket(sender, playfieldName, data);
         }
     }
 }

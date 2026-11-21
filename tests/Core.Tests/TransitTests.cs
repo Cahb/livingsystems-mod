@@ -116,6 +116,40 @@ public class TransitTests
 public class RumourTests
 {
     [Fact]
+    public void Crews_nearby_retell_what_other_traders_remember_about_you()
+    {
+        var w = new World();
+        var traders = Enumerable.Range(0, 12).Select(i => w.Add(new SimAgent { Id = "t" + i, Name = "Ship" + i, Kind = "trader", System = "A", State = "dock" })).ToList();
+        var bad = traders[0];
+        w.Remember(bad, "memory.escort.pid:7", "abandoned");
+        // about half the crews heard it — over the other eleven, some do and some don't
+        var heard = traders.Skip(1).Count(t => w.Rumours(t, "pid:7", 1000, (a, b) => b).Any(r => r.Contains("ran out on " + bad.Name)));
+        Assert.InRange(heard, 1, 10);
+        // the topic it comes under, and nothing about a player they never met
+        Assert.All(traders.Skip(1).SelectMany(t => w.RumourTopics(t, new List<string> { "pid:7" }, 1000, (a, b) => b)).Where(r => r.Text.Contains("ran out")),
+                   r => Assert.Equal("About you", r.Topic));
+        Assert.DoesNotContain(traders.Skip(1).SelectMany(t => w.Rumours(t, "pid:8", 1000, (a, b) => b)), r => r.Contains("ran out on"));
+    }
+
+    [Fact]
+    public void Stories_say_how_old_they_are_and_fade()
+    {
+        var w = new World();
+        var traders = Enumerable.Range(0, 12).Select(i => w.Add(new SimAgent { Id = "t" + i, Name = "Ship" + i, Kind = "trader", System = "A", State = "dock" })).ToList();
+        w.LastTick = 10000;
+        w.Remember(traders[0], "memory.hostile.pid:7", "x");
+        List<string> Told(double now) => traders.Skip(1).SelectMany(t => w.Rumours(t, "pid:7", now, (a, b) => b)).Where(r => r.Contains("opened fire")).ToList();
+        var soon = Told(10000 + 3 * 3600);
+        Assert.NotEmpty(soon);
+        Assert.All(soon, r => Assert.Contains("(3 h ago)", r));
+        Assert.Empty(Told(10000 + (w.Config.WordHours + 1) * 3600));   // stale: nobody's telling it any more
+        // a story from before times were kept: still told, no age
+        traders[0].Extra.Remove(World.When("memory.hostile.pid:7"));
+        Assert.All(Told(10000 + 999 * 3600), r => Assert.DoesNotContain("ago", r));
+        Assert.NotEmpty(Told(10000 + 999 * 3600));
+    }
+
+    [Fact]
     public void Crews_tell_of_attacks_wrecks_hubs_and_grudges_nearby()
     {
         var w = new World { Galaxy = Galaxy.Parse(new[] { @"SolarSystems:

@@ -11,6 +11,17 @@ namespace LivingSystems
     /// </summary>
     sealed class DediTrade
     {
+        /// <summary>The exchange window's grid: 7 × 7 slots.</summary>
+        public const int WindowSlots = 49;
+
+        /// <summary>An item's own stack size (the game's configs; MoneyCard 50k; unknown → 500).</summary>
+        public static int StackOf(string baseName)
+        {
+            if (baseName == Core.Sim.World.Strongbox) return 50000;
+            var per = Core.Sim.World.StackSizeOf?.Invoke(baseName) ?? 0;
+            return per > 0 ? per : 500;
+        }
+
         const int SellPrice = 10, BuyPrice = 15;   // credits per item, placeholder
 
         readonly IModApi api;
@@ -41,6 +52,10 @@ namespace LivingSystems
             public Action<int> Fulfilled;
             /// <summary>Credits it can spend buying from you this deal.</summary>
             public int Cash;
+            /// <summary>Window text instead of the trader's (a hired tug's hold: take only, nothing bought).</summary>
+            public string Title, Desc;
+            /// <summary>The word for taking goods out ("bought" from a trader; "took" from your own tug's hold).</summary>
+            public string TakeVerb = "bought";
             /// <summary>Called after the deal: units taken per item, and the credits that changed hands (+ = you paid it).</summary>
             public Action<Dictionary<string, int>, int> Done;
         }
@@ -57,22 +72,24 @@ namespace LivingSystems
             if (busy.Value != null) { say(pid, $"{d.Ship}: we're serving another captain — give us a minute."); return true; }
             if (!HasMapping) { say(pid, "(no item list yet — it comes from your playfield server; try again in a moment)"); return false; }
             var stock = new List<ItemStack>();
-            var offeredById = new Dictionary<int, StockLine>();
+            var offeredById = new Dictionary<string, StockLine>(StringComparer.Ordinal);
             foreach (var line in d.Stock.Where(x => x.Amt > 0))
             {
-                if (!nameToId.TryGetValue(line.Item, out var id)) continue;
-                offeredById[id] = line;
-                for (int left = line.Amt; left > 0 && stock.Count < 24; left -= 500)
-                    stock.Add(new ItemStack { id = id, count = Math.Min(500, left), slotIdx = (byte)stock.Count });
+                var baseName = Core.Sim.World.KeyBase(line.Item, out var ammo, out var decay);   // a token etc.: its own data goes along
+                if (!nameToId.TryGetValue(baseName, out var id)) continue;
+                offeredById[line.Item] = line;
+                var per = StackOf(baseName);
+                for (int left = line.Amt; left > 0 && stock.Count < WindowSlots; left -= per)
+                    stock.Add(new ItemStack { id = id, count = Math.Min(per, left), slotIdx = (byte)stock.Count, ammo = ammo, decay = decay });
             }
             var list = string.Join(", ", offeredById.Values.Select(x => $"{Core.Sim.World.Humanize(x.Item)} {x.Price:0}"));
             var info = new ItemExchangeInfo
             {
                 id = pid,
-                title = $"{d.Ship} — make your pick, press the button for a QUOTE",   // the client keeps the first button label it saw
-                desc = "STEP 1: take / put in what you like, then press the button for a quote. " + (list.Length > 0 ? $"Prices (cr each): {list}. Take what you want." : "Nothing to sell this trip.") +
-                       $" Put in what you want to sell (we have {d.Cash:N0} cr to spend). Press Quote: we'll tell you what we'd pay.",
-                buttonText = "Quote",
+                title = d.Title ?? $"{d.Ship} — take what you buy, put in what you sell, then Done",   // the client keeps the first button label it saw
+                desc = d.Desc ?? (list.Length > 0 ? $"Prices (cr each): {list}. " : "Nothing to sell this trip. ") +
+                       $"Put in what you want to sell — we have {d.Cash:N0} cr to spend. Done settles it; what we won't take comes back to you.",
+                buttonText = "Done",
                 items = stock.ToArray(),
             };
             pending[pid] = new Pending { Kind = "ship", Offered = stock, Deal = d, Quoted = BoxKey(stock), Ship = ship, Opened = clock.Elapsed.TotalSeconds };
@@ -81,6 +98,8 @@ namespace LivingSystems
             return true;
         }
         readonly Dictionary<int, Pending> pending = new Dictionary<int, Pending>();
+        /// <summary>A ship deal is settled (player, what happened): the hail menu shows the ship page again with it.</summary>
+        public Action<int, string> AfterTrade;
 
         /// <summary>Asks the player's credit balance (async: the answer comes with a later event).</summary>
         readonly Action<int, Action<double>> balance;
@@ -169,8 +188,11 @@ namespace LivingSystems
             if (p.Kind == "ship")
             {   // two steps: Quote (window re-opens with the same items + the offer) → Accept with the box unchanged = settle
                 var d = p.Deal;
-                var offered = p.Offered.GroupBy(o => o.id).ToDictionary(g => g.Key, g => g.Sum(o => o.count));
-                var inBox = box.GroupBy(i => i.id).ToDictionary(g => g.Key, g => g.Sum(i => i.count));
+                // by item + its stack data: two tokens with different ids are different goods
+                string Key(ItemStack x) => Core.Sim.World.StackKey(Name(x.id), x.ammo, x.decay);
+                var offered = p.Offered.GroupBy(Key).ToDictionary(g => g.Key, g => g.Sum(o => o.count), StringComparer.Ordinal);
+                var inBox = box.GroupBy(Key).ToDictionary(g => g.Key, g => g.Sum(i => i.count), StringComparer.Ordinal);
+                var idOf = box.Concat(p.Offered).GroupBy(Key).ToDictionary(g => g.Key, g => g.First().id, StringComparer.Ordinal);
                 double pay = 0, spent = 0, cost = 0;
                 var bought = new List<string>(); var sold = new List<string>(); var refusedTxt = new List<string>();
                 var refused = new List<KeyValuePair<int, int>>();
@@ -178,7 +200,7 @@ namespace LivingSystems
                 // you buy first (that money is its to spend), then it buys from you until its purse is empty
                 foreach (var kv in offered)
                 {
-                    var name = Name(kv.Key);
+                    var name = kv.Key;
                     var line = d.Stock.FirstOrDefault(x => x.Item == name);
                     var left = inBox.TryGetValue(kv.Key, out var l) ? l : 0;
                     if (left < kv.Value) { var n = kv.Value - left; cost += n * (line?.Price ?? 0); taken[name] = n; bought.Add($"{Core.Sim.World.Humanize(name)} {n}"); }
@@ -186,9 +208,10 @@ namespace LivingSystems
                 pay = -cost;
                 var purse = d.Cash + cost;
                 var wantLeft = d.WantLeft; var wanted = 0;
-                void Offer(int id, int n)
+                void Offer(string key, int n)
                 {
-                    var name = Name(id);
+                    var id = idOf[key];
+                    var name = Core.Sim.World.KeyBase(key, out _, out _);   // what it buys goes by the item, whatever its data
                     if (name == d.WantItem && wantLeft > 0)
                     {   // what it asked for: the premium price, up to how many it wants (the rest at the usual price below)
                         var w = (int)Math.Min(Math.Min(n, wantLeft), Math.Floor((purse - spent) / Math.Max(1, d.WantPrice)));
@@ -203,20 +226,6 @@ namespace LivingSystems
                 foreach (var kv in offered) { var left = inBox.TryGetValue(kv.Key, out var l) ? l : 0; if (left > kv.Value) Offer(kv.Key, left - kv.Value); }
                 foreach (var kv in inBox.Where(kv => !offered.ContainsKey(kv.Key))) Offer(kv.Key, kv.Value);
                 credits = (int)Math.Round(pay);
-                var key = BoxKey(box);
-                if (key != p.Quoted)
-                {   // the box changed since the last offer: quote, re-open with everything still in it
-                    p.Quoted = key; p.Acked = false; p.Opened = clock.Elapsed.TotalSeconds; pending[r.id] = p;
-                    var q = new List<string>();
-                    if (bought.Count > 0) q.Add($"You take: {string.Join(", ", bought)} (−{cost:N0} cr).");
-                    if (sold.Count > 0) q.Add($"We'd buy: {string.Join(", ", sold)}.");
-                    if (refusedTxt.Count > 0) q.Add($"Won't take: {string.Join(", ", refusedTxt)} — take it out, or it comes back to you.");
-                    q.Add($"Net: {(credits >= 0 ? "+" : "")}{credits:N0} cr. Accept — or change the box for a new quote.");
-                    var info = new ItemExchangeInfo { id = r.id, title = $"{d.Ship} — OFFER: press the button again to ACCEPT", desc = "STEP 2 — OFFER (press the button again to accept; change the box for a new quote): " + string.Join(" ", q), buttonText = "Accept", items = box.ToArray() };
-                    p.OpenSeq = request(CmdId.Request_Player_ItemExchange, info);
-                    say(r.id, $"{d.Ship}: {string.Join(" ", q)}");
-                    return;
-                }
                 if (credits < 0 && balance != null && !p.Funded)
                 {   // you owe it: check the balance first (the items are already in your inventory, so the deal can't just fail)
                     var owed = -credits; var pid = r.id;
@@ -225,20 +234,27 @@ namespace LivingSystems
                     {
                         p.Checking = false;
                         if (have >= owed) { p.Funded = true; pending[pid] = p; OnExchange(seqNr, r, request); return; }
-                        p.Quoted = ""; p.Acked = false; p.Opened = clock.Elapsed.TotalSeconds; pending[pid] = p;   // any press re-quotes
-                        var msg = $"You're {owed - have:N0} cr short (you have {have:N0}, the deal costs {owed:N0}). Put something back, then press for a new quote.";
-                        var info = new ItemExchangeInfo { id = pid, title = $"{d.Ship} — NOT ENOUGH CREDITS: put something back", desc = msg, buttonText = "Accept", items = box.ToArray() };
-                        p.OpenSeq = request(CmdId.Request_Player_ItemExchange, info);
-                        say(pid, $"{d.Ship}: {msg}");
+                        // short: never re-open the window from here — closing it reports an empty box (the goods are in your
+                        // inventory already), and re-opening on every close was an endless loop the player couldn't get out of.
+                        // You pay what you have; the trader lets the rest slide this once.
+                        pending.Remove(pid);   // the deal is over: later window events are ignored
+                        var paid = Math.Max(0, (int)Math.Floor(have));
+                        if (paid > 0) request(CmdId.Request_Player_AddCredits, new IdCredits { id = pid, credits = -paid });
+                        say(pid, $"{d.Ship}: you're {owed - paid:N0} cr short — we'll take the {paid:N0} you've got and call it square. Don't make a habit of it.");
+                        try { d.Done?.Invoke(taken, paid); } catch (Exception ex) { log("trade: updating the trader after a short deal threw: " + ex.Message); }
+                        log($"trade: {pid} short {owed - paid} cr on {d.Ship}: paid {paid}, no re-open");
+                        AfterTrade?.Invoke(pid, $"You were {owed - paid:N0} cr short — we took the {paid:N0} you had and called it square.");
                     });
                     p.Acked = true; pending[r.id] = p;   // held until the balance comes back (a second press meanwhile is ignored)
                     return;
                 }
                 foreach (var x in refused) GiveBack(r.id, x.Key, x.Value, request, "returned");
                 var parts = new List<string>();
-                if (bought.Count > 0) parts.Add("bought " + string.Join(", ", bought));
+                if (bought.Count > 0) parts.Add(d.TakeVerb + " " + string.Join(", ", bought));
                 if (sold.Count > 0) parts.Add("sold " + string.Join(", ", sold));
-                say(r.id, parts.Count == 0 ? $"{d.Ship}: no deal." : $"{d.Ship}: {string.Join("; ", parts)} — {(credits >= 0 ? "+" : "")}{credits:N0} cr");
+                var outcome = parts.Count == 0 ? "No deal." : $"{char.ToUpper(string.Join("; ", parts)[0])}{string.Join("; ", parts).Substring(1)} — {(credits >= 0 ? "+" : "")}{credits:N0} cr.";
+                say(r.id, $"{d.Ship}: {outcome}");
+                AfterTrade?.Invoke(r.id, outcome);
                 if (credits != 0) request(CmdId.Request_Player_AddCredits, new IdCredits { id = r.id, credits = credits });   // money first: the deal is done
                 try { d.Done?.Invoke(taken, -credits); if (wanted > 0) d.Fulfilled?.Invoke(wanted); }
                 catch (Exception ex) { log("trade: updating the trader after the deal threw: " + ex.Message); }

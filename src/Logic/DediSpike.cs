@@ -11,7 +11,7 @@ namespace LivingSystems
     /// Dedi half of the F00 spike: reads "/ls" chat commands, spawns ships via the legacy API,
     /// shows dialogs, and forwards movement/inspection commands to the player's PfServer.
     /// </summary>
-    sealed class DediSpike
+    sealed partial class DediSpike
     {
         readonly IModApi api;
         readonly Action<string> log;
@@ -23,6 +23,7 @@ namespace LivingSystems
         int spawnCounter;
         int purgeFor;
         int gsinfoFor; List<int> gsinfoIds = new List<int>();
+        int gstatsFor;
         DediTrade trade;
 
         /// <summary>Called with (entity id, name, playfield) for every ship we spawn — the registry's source of truth.</summary>
@@ -58,12 +59,18 @@ namespace LivingSystems
         {
             try
             {
-                if (m == null || !SpikeCommand.TryParse(m.Text, out var cmd)) return;
-                var pid = m.SenderEntityId;
-                log($"chat cmd from {pid}: {m.Text}");
-                Handle(pid, cmd);
+                if (m != null) RunCommand(m.SenderEntityId, m.Text, "chat");
             }
             catch (Exception e) { log("OnChat threw: " + e); }
+        }
+
+        /// <summary>One "/ls …" line as if <paramref name="pid"/> typed it (chat and the script file share this). False = not ours.</summary>
+        public bool RunCommand(int pid, string text, string from)
+        {
+            if (!SpikeCommand.TryParse(text, out var cmd)) return false;
+            log($"{from} cmd from {pid}: {text}");
+            Handle(pid, cmd);
+            return true;
         }
 
         void Handle(int pid, SpikeCommand cmd)
@@ -103,23 +110,25 @@ namespace LivingSystems
                     Request(CmdId.Request_GlobalStructure_List, null);
                     break;
                 case "movepf": MovePlayfield(pid, cmd); break;
-                case "sim": if (OnSim != null) OnSim(pid, cmd); else Say(pid, "sim not running (see log)"); break;
-                case "kiosk": Kiosk(pid, cmd.Arg(0, "")); break;
-                case "kit":
-                {
-                    // Everything needed to build a kiosk prefab. Items land in the TOOLBAR first.
-                    var kit = new[] { P("CoreNPC", 2), P("Core", 2), P("HullLargeBlocks", 60), P("LightLargeBlocks", 4), P("Trader", 3) };   // no tuples: no ValueTuple in the game runtime
-                    var gave = new List<string>();
-                    foreach (var k in kit)
-                        if (trade.TryId(k.Key, out var kid))
-                        {
-                            legacy.Game_Request(CmdId.Request_Player_AddItem, NextSeq(), new IdItemStack { id = pid, itemStack = new ItemStack { id = kid, count = k.Value } });
-                            gave.Add($"{k.Key}x{k.Value}");
-                        }
-                        else gave.Add($"{k.Key}=?");
-                    Say(pid, "kiosk kit (needs 5 free toolbar slots): " + string.Join(", ", gave));
+                case "dlg": DialogProbe(pid, cmd.Arg(0, "")); break;
+                case "gstats":
+                {   // probe: block counts of ANY structure by id (far POI in this playfield, or an unloaded one) via legacy BlockStatistics
+                    if (cmd.Args.Count < 1 || !int.TryParse(cmd.Args[0], out var sid)) { Say(pid, "/ls gstats <entity id>"); break; }
+                    gstatsFor = pid;
+                    var seq = Request(CmdId.Request_Structure_BlockStatistics, new Id { id = sid });
+                    log($"gstats {sid} seq={seq} (by {pid})");
+                    Say(pid, $"block stats for {sid} requested (seq {seq})");
                     break;
                 }
+                case "gdestroy":
+                {   // probe: does Request_Entity_Destroy remove a structure (e.g. a POI) whose playfield is NOT loaded? Check with /ls gsinfo / gents.
+                    if (cmd.Args.Count < 1 || !int.TryParse(cmd.Args[0], out var gid)) { Say(pid, "/ls gdestroy <entity id>"); break; }
+                    var seq = Request(CmdId.Request_Entity_Destroy, new Id { id = gid });
+                    log($"gdestroy {gid} seq={seq} (by {pid})");
+                    Say(pid, $"destroy {gid} sent (seq {seq}) — check /ls gsinfo {gid}");
+                    break;
+                }
+                case "sim": if (OnSim != null) OnSim(pid, cmd); else Say(pid, "sim not running (see log)"); break;
                 case "heal":
                     // Test-session convenience: refill the player's vitals through the legacy API.
                     RequestPlayerInfo(pid, p =>
@@ -145,7 +154,7 @@ namespace LivingSystems
                     break;
                 case "trade": if (legacy == null) Say(pid, "legacy API not attached"); else trade.Open(pid, cmd.Args, Request); break;
                 case "items": trade.Items(pid, cmd.Arg(0, "")); break;
-                case "move": case "stop": case "clear": case "list": case "info": case "faction": case "goto": case "follow": case "scan": case "cargo": case "perf": case "npc": case "traderblock": case "holo": case "tp": case "find": case "spawn2": case "record": case "makekiosk": case "pad": case "padinfo": case "hail": case "comms": case "fly":
+                case "move": case "stop": case "clear": case "list": case "info": case "faction": case "goto": case "follow": case "scan": case "cargo": case "perf": case "npc": case "traderblock": case "holo": case "tp": case "find": case "spawn2": case "record": case "hail": case "comms": case "fly": case "rock":
                     ForwardToPlayfield(pid, cmd); break;
                 default: Say(pid, SpikeCommand.HelpFor(cmd.Verb == "help" ? cmd.Arg(0, "") : "")); break;
             }
@@ -211,16 +220,6 @@ namespace LivingSystems
                     if (!trade.HasMapping) trade.SetMapping(m);
                     return;
                 }
-                if (f.Length >= 4 && f[0] == "export" && int.TryParse(f[1], out var epid) && int.TryParse(f[2], out var eid) && int.TryParse(f[3], out var etype))
-                {
-                    var path = KioskPath();
-                    System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path));
-                    kioskType = (EntityType)etype;
-                    var s = Request(CmdId.Request_Entity_Export, new EntityExportInfo { id = eid, playfield = playfieldName, filePath = path, isForceUnload = false });
-                    log($"export {eid} ({kioskType}) from '{playfieldName}' to '{path}' seq={s}");
-                    Say(epid, $"export requested -> {path}. Then: /ls kiosk");
-                    return;
-                }
                 if (f.Length >= 5 && f[0] == "tpto" && int.TryParse(f[1], out var tpid))
                 {
                     float G(string v) => float.Parse(v, System.Globalization.CultureInfo.InvariantCulture);
@@ -274,28 +273,21 @@ namespace LivingSystems
                     hailContacts[hpid] = f.Skip(2).Select(Contact.Parse).Where(c => c != null).ToList();
                     hailPf[hpid] = playfieldName;
                     // pointed at one of ours (nose cone): straight to that ship, no pager
-                    if (hailContacts[hpid].Count > 0 && hailContacts[hpid][0].Nose) { hailIndex[hpid] = 0; hailFocus[hpid] = hailContacts[hpid][0]; ShowShip(hpid); }
+                    if (hailContacts[hpid].Count > 0 && hailContacts[hpid][0].Nose) { var hm = MenuOf(hpid); hm.Back.Clear(); hm.Build = null; hailFocus[hpid] = hailContacts[hpid][0]; ShowShip(hpid); }
                     else ShowContacts(hpid);
                     return;
                 }
                 if (f.Length >= 3 && f[0] == "kioskgone" && int.TryParse(f[1], out var gpid) && int.TryParse(f[2], out var gid))
                 {
-                    if (kioskOf.TryGetValue(gpid, out var cur) && cur == gid) kioskOf.Remove(gpid);
                     // Playfield RemoveEntity leaves the structure in the global structure DB (verified via gents): destroy it there too.
                     var ds = Request(CmdId.Request_Entity_Destroy, new Id { id = gid });
-                    log($"kiosk/structure {gid} gone on the playfield; global destroy seq={ds}");
+                    log($"structure {gid} removed on the playfield (purge / leftover kiosk); global destroy seq={ds}");
                     return;
                 }
                 if (f.Length >= 3 && f[0] == "npcname" && int.TryParse(f[1], out var nid))
                 {
                     var s = Request(CmdId.Request_Entity_SetName, new IdPlayfieldName { id = nid, playfield = playfieldName, name = f[2] });
                     log($"SetName {nid} -> '{f[2]}' seq={s}");
-                    return;
-                }
-                if (f.Length >= 8 && f[0] == "padspawn" && int.TryParse(f[1], out var ppid))
-                {
-                    float F(string v) => float.Parse(v, System.Globalization.CultureInfo.InvariantCulture);
-                    SpawnKioskAt(ppid, playfieldName, new PVector3(F(f[2]), F(f[3]), F(f[4])), new PVector3(F(f[5]), F(f[6]), F(f[7])));
                     return;
                 }
                 if (f.Length >= 3 && f[0] == "say" && int.TryParse(f[1], out var pid))
@@ -379,9 +371,12 @@ namespace LivingSystems
             {
                 api.Network.SendToPlayfieldServer(LivingSystemsMod.Channel, playfield, Wire.Pack(0, "wantfaction", newId, group, factionId));
                 var s = NextSeq();
+                // our own prefabs (Content/Mods/LivingSystems/prefabs/, e.g. a re-centred tug) win over the scenario's
+                var ownDir = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(typeof(LivingSystemsMod).Assembly.Location) ?? ".", "prefabs");
+                var useOwn = System.IO.File.Exists(System.IO.Path.Combine(ownDir, prefab + ".epb"));
                 legacy.Game_Request(CmdId.Request_Entity_Spawn, s, new EntitySpawnInfo
                 {
-                    forceEntityId = newId, playfield = playfield, pos = pos, rot = rot, name = name,
+                    forceEntityId = newId, playfield = playfield, pos = pos, rot = rot, name = name, prefabDir = useOwn ? ownDir : null,
                     type = (byte)type, entityTypeName = "", prefabName = prefab, factionGroup = group, factionId = factionId,
                 });
                 OnSpawned?.Invoke(newId, name, playfield);
@@ -404,64 +399,6 @@ namespace LivingSystems
             legacy.Game_Request(CmdId.Request_Get_Factions, s, new Id { id = 1 });
         }
 
-        static KeyValuePair<string, int> P(string k, int v) => new KeyValuePair<string, int>(k, v);
-
-        // ---- kiosk: spawn a copy of the exported construct next to the player --------------------
-
-        EntityType kioskType = EntityType.CV;
-        readonly Dictionary<int, int> kioskOf = new Dictionary<int, int>();   // player -> kiosk entity id
-
-        static string KioskPath() => System.IO.Path.Combine(
-            System.IO.Path.GetDirectoryName(typeof(LivingSystemsMod).Assembly.Location) ?? ".", "prefabs", "LS_Kiosk.dat");
-
-        void Kiosk(int pid, string arg)
-        {
-            if (arg == "off")
-            {
-                if (kioskOf.TryGetValue(pid, out var kid))
-                {
-                    // NPCs first (bodies otherwise stay behind), then the structure.
-                    var pf = PlayfieldOf(pid);
-                    if (pf != null) api.Network.SendToPlayfieldServer(LivingSystemsMod.Channel, pf, Wire.Pack(pid, "kioskoff", kid));
-                    else Request(CmdId.Request_Entity_Destroy, new Id { id = kid });   // player not on a playfield: best effort
-                    kioskOf.Remove(pid); Say(pid, $"kiosk {kid} dismissed");
-                }
-                else Say(pid, "no kiosk of yours");
-                return;
-            }
-            var path = KioskPath();
-            if (!System.IO.File.Exists(path)) { Say(pid, $"no {path} yet: /ls makekiosk first (and wait a second for the export)"); return; }
-            RequestPlayerInfo(pid, p =>
-            {
-                var place = SpawnGeometry.Place(new SpawnGeometry.V3(p.pos.x, p.pos.y, p.pos.z), new SpawnGeometry.V3(p.rot.x, p.rot.y, p.rot.z), 25f, 0);
-                SpawnKioskAt(pid, p.playfield, new PVector3(place.Pos.X, place.Pos.Y, place.Pos.Z), new PVector3(0, place.Rot.Y, 0));
-            });
-        }
-
-        void SpawnKioskAt(int pid, string playfield, PVector3 pos, PVector3 rot)
-        {
-            var path = KioskPath();
-            if (!System.IO.File.Exists(path)) { Say(pid, "no kiosk export yet: /ls makekiosk first"); return; }
-            if (kioskOf.TryGetValue(pid, out var old))
-            {
-                api.Network.SendToPlayfieldServer(LivingSystemsMod.Channel, playfield, Wire.Pack(pid, "kioskoff", old));
-                Request(CmdId.Request_Entity_Destroy, new Id { id = old }); kioskOf.Remove(pid);
-            }
-            RequestNewEntityId(newId =>
-            {
-                var info = new EntitySpawnInfo
-                {
-                    forceEntityId = newId, playfield = playfield, pos = pos, rot = rot,
-                    name = StructureTag.Apply(KioskNames.Kiosk), type = (byte)kioskType,
-                    entityTypeName = "", exportedEntityDat = path, factionGroup = 7, factionId = 0,
-                };
-                api.Network.SendToPlayfieldServer(LivingSystemsMod.Channel, playfield, Wire.Pack(pid, "kioskfix", newId));
-                var s = Request(CmdId.Request_Entity_Spawn, info);
-                kioskOf[pid] = newId;
-                log($"kiosk spawn seq={s} id={newId} type={kioskType} at ({pos.x:0.0},{pos.y:0.0},{pos.z:0.0}) rot ({rot.x:0},{rot.y:0},{rot.z:0})");
-                Say(pid, $"kiosk {newId} deploying… '/ls kiosk off' to send it away.");
-            });
-        }
 
         /// <summary>
         /// Stage 2 probe (PLAN START HERE): does legacy Request_Entity_ChangePlayfield move a structure whose source
@@ -487,7 +424,11 @@ namespace LivingSystems
         /// <summary>Pay a player (official legacy Request_Player_AddCredits).</summary>
         public void GiveCredits(int pid, int credits) { if (legacy != null && credits > 0) Request(CmdId.Request_Player_AddCredits, new IdCredits { id = pid, credits = credits }); }
 
-        public void OnUpdate() { try { if (legacy != null) trade?.Pump(Request); } catch (Exception e) { log("trade pump threw: " + e.Message); } }
+        public void OnUpdate()
+        {
+            try { if (legacy != null) trade?.Pump(Request); } catch (Exception e) { log("trade pump threw: " + e.Message); }
+            try { PumpCalls(); } catch (Exception e) { log("call-ins threw: " + e.Message); }
+        }
 
         ushort NextSeq() { if (++seq < 1000) seq = 1000; return seq; }
 
@@ -531,6 +472,17 @@ namespace LivingSystems
                 case CmdId.Event_Player_Credits:
                     log($"credits event seq={seqNr}: {(data as IdCredits)?.credits}");
                     break;
+                case CmdId.Event_Structure_BlockStatistics:
+                {
+                    var bs = data as IdStructureBlockInfo;
+                    var stats = bs?.blockStatistics ?? new Dictionary<int, int>();
+                    foreach (var kv in stats.OrderByDescending(kv => kv.Value)) log($"gstats {bs?.id}: {trade.Name(kv.Key)} ({kv.Key}) x{kv.Value}");
+                    var line = $"{bs?.id}: {stats.Count} block types, {stats.Values.Sum()} blocks. " +
+                        string.Join(", ", stats.OrderByDescending(kv => kv.Value).Take(10).Select(kv => $"{trade.Name(kv.Key)}x{kv.Value}"));
+                    log("gstats " + line);
+                    if (gstatsFor != 0) Say(gstatsFor, line + " (full list in log)");
+                    break;
+                }
                 case CmdId.Event_GlobalStructure_List:
                     try { OnGlobalList?.Invoke(data as GlobalStructureList); } catch (Exception e) { log("global list hook threw: " + e); }
                     if (gsinfoFor != 0)
@@ -540,7 +492,7 @@ namespace LivingSystems
                             foreach (var gs in kv.Value)
                                 if (gsinfoIds.Contains(gs.id))
                                 {
-                                    var line = $"{gs.id} '{gs.name}' in '{kv.Key}' pos=({gs.pos.x:0},{gs.pos.y:0},{gs.pos.z:0}): factionGroup={gs.factionGroup} factionId={gs.factionId} coreType={gs.coreType} type={gs.type}";
+                                    var line = $"{gs.id} '{gs.name}' in '{kv.Key}' pos=({gs.pos.x:0},{gs.pos.y:0},{gs.pos.z:0}): factionGroup={gs.factionGroup} factionId={gs.factionId} coreType={gs.coreType} type={gs.type} blocks={gs.cntBlocks}";
                                     log("gsinfo " + line); Say(gsinfoFor, line);
                                 }
                         gsinfoFor = 0;
@@ -585,345 +537,6 @@ namespace LivingSystems
             }
         }
 
-        // ---- dialog (spike Q4): multi-button, two levels deep -----------------------------------
-
-        // ---- hail: contacts -> ship -> who are you / request trade ---------------------------------
-
-        sealed class Contact
-        {
-            public int Id, Group, FacId, Dist, Blocks; public bool OwnTrader, Nose; public string Name, Type, Core, Status = "", Says = "";
-            public static Contact Parse(string s)
-            {
-                var p = s.Split('~'); if (p.Length < 8) return null;
-                int.TryParse(p[0], out var id); int.TryParse(p[2], out var g); int.TryParse(p[3], out var fid);
-                int.TryParse(p[4], out var d); int.TryParse(p[7], out var b);
-                return new Contact { Id = id, Name = p[1], Group = g, FacId = fid, Dist = d, OwnTrader = p[5] == "1", Type = p[6], Blocks = b, Core = p.Length > 8 ? p[8] : "?", Status = p.Length > 9 ? p[9] : "", Says = p.Length > 10 ? p[10] : "", Nose = p.Length > 11 && p[11] == "1" };
-            }
-        }
-        readonly Dictionary<int, List<Contact>> hailContacts = new Dictionary<int, List<Contact>>();
-        readonly Dictionary<int, string> hailPf = new Dictionary<int, string>();
-        readonly Dictionary<int, Contact> hailFocus = new Dictionary<int, Contact>();
-
-        static HashSet<int> HostileGroups => Factions.Hostile;
-        static string FactionName(int g) => Factions.Name(g);
-
-        // The dialog shows at most 3 buttons (verified), and long labels wrap. So: a pager over contacts,
-        // details in the body, three short buttons, Esc closes.
-        readonly Dictionary<int, int> hailIndex = new Dictionary<int, int>();
-
-        string Describe(Contact c, int i, int n) =>
-            $"Contact {i + 1} of {n}\n\n" +
-            $"<b>{c.Name}</b>\n" +
-            $"Faction: {FactionName(c.Group)}{(HostileGroups.Contains(c.Group) ? "  (hostile)" : "")}\n" +
-            $"Type: {c.Type}, {c.Blocks} blocks, core {c.Core}\n" +
-            $"Range: {c.Dist:0} m{(c.Dist > ApproveRange ? $"  — too far to trade ({ApproveRange} m)" : "")}\n" +
-            $"Trade: {(IsAutomated(c) ? "none — automated structure" : c.OwnTrader ? "trader aboard — dock with them" : "kiosk to your TRADE_PAD")}" +
-            StatusLine(c);
-
-        void ShowContacts(int pid)
-        {
-            var cs = hailContacts.TryGetValue(pid, out var l) ? l : new List<Contact>();
-            if (cs.Count == 0) { Say(pid, "Scanning… no NPC vessels or stations within 5 km."); return; }
-            var i = hailIndex.TryGetValue(pid, out var k) ? Math.Max(0, Math.Min(k, cs.Count - 1)) : 0;
-            hailIndex[pid] = i;
-            api.Application.ShowDialogBox(pid, new DialogConfig
-            {
-                TitleText = "COMMS — contacts in range",
-                BodyText = Describe(cs[i], i, cs.Count) + "\n\n(Esc to close)",
-                ButtonTexts = new[] { "< Prev", "Hail", "Next >" },
-                ButtonIdxForEnter = 1, ButtonIdxForEsc = -1,
-            }, OnContactsButton, 100);
-        }
-
-        void OnContactsButton(int button, string link, string input, int pid, int cv)
-        {
-            if (!hailContacts.TryGetValue(pid, out var cs) || cs.Count == 0) return;
-            var i = hailIndex.TryGetValue(pid, out var k) ? k : 0;
-            if (button == 0) { hailIndex[pid] = (i - 1 + cs.Count) % cs.Count; ShowContacts(pid); }
-            else if (button == 2) { hailIndex[pid] = (i + 1) % cs.Count; ShowContacts(pid); }
-            else if (button == 1)
-            {
-                hailFocus[pid] = cs[i];
-                if (IsAutomated(cs[i])) { ShowShip(pid, $"{cs[i].Name}: automated structure. No crew aboard. No response."); return; }
-                ShowShip(pid);
-            }
-            // anything else (Esc) closes
-        }
-
-        /// <summary>Hail → Talk: a sim ship's rumours (DediSim.Talk: entity, pid, n → text; null = not a sim ship).</summary>
-        public Func<int, int, int, string> TalkFor;
-        readonly Dictionary<int, int> talkIndex = new Dictionary<int, int>();
-
-        // Dialogs show at most 3 buttons. Our ships: Talk | Trade | Jobs (Esc = leave); others: Trade | Back.
-        // Orders (follow / hold / join) are parked: ShowOrders stays in code, not on the menu.
-        void ShowShip(int pid, string reply = null)
-        {
-            if (!hailFocus.TryGetValue(pid, out var c)) return;
-            if (StructureTag.IsTagged(c.Name) && TollFor?.Invoke(c.Id, pid) is DediSim.Toll toll) { ShowPirate(pid, c, toll, reply); return; }
-            if (StructureTag.IsTagged(c.Name) && CollectFor != null && legacy != null && TradeLineFor?.Invoke(c.Id) != null)   // traders pay, not wrecks / patrols / raiders
-            {   // a bounty settled since: any trader pays it
-                var paid = CollectFor(pid, out var credits);
-                if (paid != null && credits > 0) { Request(CmdId.Request_Player_AddCredits, new IdCredits { id = pid, credits = credits }); reply = paid + (reply != null ? "\n" + reply : ""); }
-            }
-            var what = StructureTag.IsTagged(c.Name) && TradeLineFor?.Invoke(c.Id) is string tl
-                ? $"{tl}\nTrade within {ApproveRange} m."
-                : c.OwnTrader ? "Trader aboard — dock with us to trade." : "No trader aboard; we can project a trade kiosk to your TRADE_PAD.";
-            var ours = StructureTag.IsTagged(c.Name);   // our ships: third button = work (escort); Esc closes
-            Echo(pid, c.Name, reply ?? c.Says);
-            api.Application.ShowDialogBox(pid, new DialogConfig
-            {
-                TitleText = $"{c.Name} [{FactionName(c.Group)}]",
-                BodyText = (reply ?? (string.IsNullOrEmpty(c.Says) ? "Channel open." : $"\"{c.Says}\"")) + StatusLine(c) + $"\n\n{c.Type}, {c.Blocks} blocks. Range {c.Dist:0} m.\n{what}\n(Esc to close)",
-                ButtonTexts = ours ? new[] { "Talk", "Trade", "Jobs" } : new[] { "Trade", "Back" },
-                ButtonIdxForEsc = -1,
-            }, OnShipOption, 101);
-        }
-
-        void OnShipOption(int button, string link, string input, int pid, int cv)
-        {
-            if (!hailFocus.TryGetValue(pid, out var c)) return;
-            if (!StructureTag.IsTagged(c.Name))
-            {
-                if (button == 0) RequestTrade(pid, c);
-                else if (button == 1) ShowContacts(pid);
-                return;
-            }
-            if (button == 0) { talkIndex[pid] = 0; ShowTalk(pid); return; }
-            if (button == 1) { RequestTrade(pid, c); return; }
-            if (button == 2) ShowJobs(pid);
-        }
-
-        /// <summary>A pirate answers a hail: its price to look the other way — Pay | Back. Paying makes it break off and leave you be.</summary>
-        void ShowPirate(int pid, Contact c, DediSim.Toll toll, string reply)
-        {
-            var text = reply ?? toll.Line;
-            Echo(pid, c.Name, text);
-            api.Application.ShowDialogBox(pid, new DialogConfig
-            {
-                TitleText = $"{c.Name} [Pirates]",
-                BodyText = $"\"{text}\"\n\nRange {c.Dist:0} m.\n(Esc to close)",
-                ButtonTexts = toll.Price > 0 ? new[] { $"Pay {toll.Price:N0} cr", "Back" } : new[] { "Back" },
-                ButtonIdxForEsc = -1,
-            }, (button, link, input, p, cv) =>
-            {
-                if (!hailFocus.TryGetValue(p, out var cc) || cc.Id != c.Id) return;
-                if (toll.Price > 0 && button == 0) PayToll(p, cc, toll.Price);
-                else ShowContacts(p);
-            }, 108);
-        }
-
-        void PayToll(int pid, Contact c, int price)
-        {
-            if (legacy == null || !hailPf.TryGetValue(pid, out var pf)) { Say(pid, "Lost contact."); return; }
-            RequestPlayerInfo(pid, info =>
-            {
-                // the dialog may have sat open: still alive, still the same price? (no paying a dead pirate)
-                var now = TollFor?.Invoke(c.Id, pid);
-                if (now == null || now.Price <= 0) { Echo(pid, c.Name, "(no answer — they're gone)"); return; }
-                if (now.Price != price) { Echo(pid, c.Name, $"Price changed: {now.Price:N0} cr. Hail again."); return; }
-                if (info == null || info.credits < price) { Echo(pid, c.Name, "You haven't got that kind of money. Shame."); return; }
-                Request(CmdId.Request_Player_AddCredits, new IdCredits { id = pid, credits = -price });
-                api.Network.SendToPlayfieldServer(LivingSystemsMod.Channel, pf, Wire.Pack(0, "fly", "sim", "paid", c.Id, pid));
-                TollPaid?.Invoke(c.Id, price);   // the pirate pockets it (banked at its hub, or in its wreck if you shoot it after all)
-                Echo(pid, c.Name, $"Pleasure doing business. ({price:N0} cr paid)");
-                log($"toll: {pid} paid {price} cr to {c.Id} '{c.Name}'");
-            });
-        }
-
-        /// <summary>Talk: what the crew has heard (rumours from the sim) — "Ask more" walks through them.</summary>
-        void ShowTalk(int pid)
-        {
-            if (!hailFocus.TryGetValue(pid, out var c)) return;
-            var n = talkIndex.TryGetValue(pid, out var k) ? k : 0;
-            var text = TalkFor?.Invoke(c.Id, pid, n) ?? (string.IsNullOrEmpty(c.Says) ? "Not much to say." : c.Says);
-            Echo(pid, c.Name, System.Text.RegularExpressions.Regex.Replace(text, @"\s*\(\d+ of \d+\)$", ""));
-            api.Application.ShowDialogBox(pid, new DialogConfig
-            {
-                TitleText = $"{c.Name} — talk",
-                BodyText = $"\"{text}\"\n\n(Esc to close)",
-                ButtonTexts = new[] { "Ask more", "Back" },
-                ButtonIdxForEsc = -1,
-            }, (button, link, input, p, cv) =>
-            {
-                if (button == 0) { talkIndex[p] = (talkIndex.TryGetValue(p, out var i) ? i : 0) + 1; ShowTalk(p); }
-                else if (button == 1) ShowShip(p);
-            }, 106);
-        }
-
-        /// <summary>Jobs: work this ship offers. Escort today (it decides per leg whether it wants one); more jobs later.</summary>
-        void ShowJobs(int pid)
-        {
-            if (!hailFocus.TryGetValue(pid, out var c)) return;
-            var bounty = BountyFor?.Invoke(c.Id, pid);
-            api.Application.ShowDialogBox(pid, new DialogConfig
-            {
-                TitleText = $"{c.Name} — jobs",
-                BodyText = "Work we might have for you:\n• Escort — see us safely to our jump." + (bounty != null ? "\n• Bounty — there's a pirate we want dead." : "") + "\n\n(Esc to go back)",
-                ButtonTexts = bounty != null ? new[] { "Escort?", "Bounty?" } : new[] { "Escort?" },
-                ButtonIdxForEsc = -1,
-            }, (button, link, input, p, cv) =>
-            {
-                if (!hailFocus.TryGetValue(p, out var cc)) return;
-                if (button == 0) SendOrder(p, cc, "escort", 0);
-                else if (button == 1 && bounty != null) ShowBounty(p, cc, bounty);
-                else ShowShip(p);
-            }, 107);
-        }
-
-        /// <summary>The bounty on offer: Accept | Back.</summary>
-        void ShowBounty(int pid, Contact c, string text)
-        {
-            Echo(pid, c.Name, text);
-            api.Application.ShowDialogBox(pid, new DialogConfig
-            {
-                TitleText = $"{c.Name} — bounty",
-                BodyText = $"\"{text}\"\n\n(Esc to go back)",
-                ButtonTexts = new[] { "Accept", "Back" },
-                ButtonIdxForEsc = -1,
-            }, (button, link, input, p, cv) =>
-            {
-                if (!hailFocus.TryGetValue(p, out var cc) || cc.Id != c.Id) return;
-                if (button == 0) ShowShip(p, AcceptBountyFor?.Invoke(cc.Id, p) ?? "That job's gone.");
-                else ShowJobs(p);
-            }, 109);
-        }
-
-        void ShowOrders(int pid, string reply = null)
-        {
-            if (!hailFocus.TryGetValue(pid, out var c)) return;
-            api.Application.ShowDialogBox(pid, new DialogConfig
-            {
-                TitleText = $"{c.Name} — orders",
-                BodyText = (reply ?? "Orders?") + StatusLine(c) + "\n\n(Esc to close)",
-                ButtonTexts = new[] { "Follow me", "Hold position", "More…" },
-                ButtonIdxForEsc = -1,
-            }, OnOrder, 102);
-        }
-
-        /// <summary>Second orders page (3-button limit): faction join/leave, release, back.</summary>
-        void ShowMoreOrders(int pid)
-        {
-            if (!hailFocus.TryGetValue(pid, out var c)) return;
-            var joined = (c.Status ?? "").Contains("under your colours");
-            api.Application.ShowDialogBox(pid, new DialogConfig
-            {
-                TitleText = $"{c.Name} — orders",
-                BodyText = (joined ? "Flying under your colours: your enemies are ours."
-                                   : "Join your faction: we fly under your colours and our turrets treat your enemies as ours.") +
-                           StatusLine(c) + "\n\n(Esc to close)",
-                ButtonTexts = new[] { joined ? "Leave my faction" : "Join my faction", "Release", "Back" },
-                ButtonIdxForEsc = -1,
-            }, (button, link, input, p, cv) =>
-            {
-                if (!hailFocus.TryGetValue(p, out var cc)) return;
-                if (button == 0) SendOrder(p, cc, joined ? "leave" : "join", 0);
-                else if (button == 1) SendOrder(p, cc, "release", 0);
-                else if (button == 2) ShowOrders(p);
-            }, 104);
-        }
-
-        /// <summary>The trader's escort offer (text from its PfServer): Accept | Decline | Back.</summary>
-        void ShowEscortOffer(int pid, int shipId, string text)
-        {
-            if (!hailFocus.TryGetValue(pid, out var c) || c.Id != shipId) { Say(pid, text); return; }
-            Echo(pid, c.Name, text);
-            api.Application.ShowDialogBox(pid, new DialogConfig
-            {
-                TitleText = $"{c.Name} — escort contract",
-                BodyText = text + "\n\n(Esc to close)",
-                ButtonTexts = new[] { "Accept", "Decline", "Back" },
-                ButtonIdxForEsc = -1,
-            }, (button, link, input, p, cv) =>
-            {
-                if (!hailFocus.TryGetValue(p, out var cc) || cc.Id != shipId) return;
-                if (button == 0) SendOrder(p, cc, "accept", 0);
-                else if (button == 1) SendOrder(p, cc, "decline", 0);
-                else if (button == 2) ShowShip(p);
-            }, 105);
-        }
-
-        static string StatusLine(Contact c) => string.IsNullOrEmpty(c.Status) ? "" : $"\nStatus: {c.Status}.";
-
-        void OnOrder(int button, string link, string input, int pid, int cv)
-        {
-            if (!hailFocus.TryGetValue(pid, out var c)) return;
-            if (button == 2) { ShowMoreOrders(pid); return; }
-            if (button == 1) { SendOrder(pid, c, "hold", 0); return; }
-            if (button == 0)
-                api.Application.ShowDialogBox(pid, new DialogConfig
-                {
-                    TitleText = $"{c.Name} — follow",
-                    BodyText = "At what distance?\n\n(Esc to close)",
-                    ButtonTexts = new[] { "Close (100 m)", "Medium (250 m)", "Far (500 m)" },
-                    ButtonIdxForEsc = -1,
-                }, OnFollowDistance, 103);
-        }
-
-        void OnFollowDistance(int button, string link, string input, int pid, int cv)
-        {
-            if (!hailFocus.TryGetValue(pid, out var c)) return;
-            var d = button == 0 ? 100 : button == 1 ? 250 : button == 2 ? 500 : -1;
-            if (d > 0) SendOrder(pid, c, "follow", d);
-        }
-
-        /// <summary>Directed order to one ship; its PfServer answers with "orderreply", shown in the ship dialog.</summary>
-        void SendOrder(int pid, Contact c, string kind, int distance)
-        {
-            if (!hailPf.TryGetValue(pid, out var pf)) { Say(pid, "Lost contact."); return; }
-            api.Network.SendToPlayfieldServer(LivingSystemsMod.Channel, pf, kind == "escort" || kind == "accept" || kind == "decline"
-                ? Wire.Pack(pid, "fly", "escort", kind == "escort" ? "offer" : kind, c.Id)
-                : Wire.Pack(pid, "fly", "order", c.Id, kind, distance));
-            log($"order {pid} -> {c.Id} '{c.Name}': {kind} {distance}");
-        }
-
-        /// <summary>Hail → Trade with a sim trader: its hold (DediSim fills it in; null = not a sim trader).</summary>
-        public Func<int, int, DediTrade.ShipDeal> ShipDealFor;   // (ship entity, player)
-        /// <summary>Hail screen: "Selling: … Buys: …" for a sim trader (null = not one).</summary>
-        public Func<int, string> TradeLineFor;
-        /// <summary>A pirate's price to look the other way (null = not one of our pirates).</summary>
-        public Func<int, int, DediSim.Toll> TollFor;
-        public Action<int, int> TollPaid;
-        /// <summary>Bounties: what this ship offers (text, null = none), taking it, and paying out settled ones on any hail.</summary>
-        public Func<int, int, string> BountyFor, AcceptBountyFor;
-        public CollectDelegate CollectFor;
-        public delegate string CollectDelegate(int pid, out int credits);
-
-        void RequestTrade(int pid, Contact c)
-        {
-            if (StructureTag.IsTagged(c.Name) && ShipDealFor?.Invoke(c.Id, pid) is DediTrade.ShipDeal deal)
-            {   // our traders sell from their own hold — heave-to range, no TRADE_PAD needed
-                if (c.Dist > ApproveRange) { ShowShip(pid, $"You're {c.Dist:0} m out. Come within {ApproveRange} m and we'll open the hold."); return; }
-                if (legacy == null) { ShowShip(pid, "(trade needs the legacy API)"); return; }
-                if (!trade.OpenShip(pid, c.Id, deal, Request)) ShowShip(pid, "Can't open the hold right now — try again in a moment.");
-                return;
-            }
-            string answer;
-            if (IsAutomated(c)) answer = "No response. It's an automated structure.";
-            else if (HostileGroups.Contains(c.Group)) answer = "Not dealing with you. Channel closed.";
-            else if (c.OwnTrader) answer = "Our trader is aboard — dock with us and talk to them in person.";
-            else if (c.Dist > ApproveRange) answer = $"You're {c.Dist:0} m out (as of your scan). Come within {ApproveRange} m and hail again.";
-            else
-            {
-                answer = "Approved. Activate your TRADE_PAD and we'll project a kiosk.";
-                if (hailPf.TryGetValue(pid, out var pf)) api.Network.SendToPlayfieldServer(LivingSystemsMod.Channel, pf, Wire.Pack(pid, "partner", c.Id));
-            }
-            log($"trade request {pid} -> {c.Id} '{c.Name}': {answer}");
-            ShowShip(pid, answer);
-        }
-
-        const int ApproveRange = 1100;   // approve trade within this; the kiosk only ends beyond the PfServer's 1300 (hysteresis)
-
-        /// <summary>Unmanned = small bases and obvious automata. They answer, but can't trade.</summary>
-        static bool IsAutomated(Contact c)
-        {
-            var n = (c.Name ?? "").ToLowerInvariant();
-            if (new[] { "satellite", "beacon", "relay", "drone", "wreck", "debris", "buoy", "sign", "gate", "jump" }.Any(n.Contains)) return true;
-            // Admin core + no trader aboard = infrastructure, any size (trading stations have a trader, so they're excluded).
-            if ((c.Core ?? "").Contains("Admin") && !c.OwnTrader) return true;
-            return c.Type == "BA" && c.Blocks > 0 && c.Blocks < 300;
-        }
-
-
         static string Clip(string s, int n) => s == null ? "" : (s.Length <= n ? s : s.Substring(0, n - 1) + "…");
 
         void ShowTraderDialog(int pid)
@@ -938,6 +551,47 @@ namespace LivingSystems
             };
             var ok = api.Application.ShowDialogBox(pid, cfg, OnTraderChoice, 1);
             log($"ShowDialogBox(level 1) -> {ok}");
+        }
+
+        /// <summary>
+        /// Probe: what the dialog box renders (rich text, colours, sizes) and whether clickable links / the text box come back
+        /// in the handler. "/ls dlg" = formatting + links (stays open on a link click), "/ls dlg close" = closes on click,
+        /// "/ls dlg input" = with a text box.
+        /// </summary>
+        void DialogProbe(int pid, string mode, string last = null)
+        {
+            var body = (last != null ? $"<color=#ffd040>Last answer: {last}</color>\n\n" : "") +
+                "<b>bold</b>  <i>italic</i>  <u>underline</u>  <s>strike</s>  <b><i><u>all three</u></i></b>\n" +
+                "<color=#ff4040>red</color> <color=#40ff40>green</color> <color=#4080ff>blue</color> <color=yellow>named yellow</color> <color=#ffffff80>half-alpha</color>\n" +
+                "<size=80%>size 80%</size>  <size=130%>size 130%</size>  <size=24>size 24</size>\n" +
+                "<mark=#ff000060>marked</mark>  <sup>sup</sup>x<sub>sub</sub>  <alpha=#60>alpha tag</alpha>  <smallcaps>Small Caps</smallcaps>\n" +
+                "<mspace=0.7em>mono 123 abc</mspace>   <cspace=0.3em>spaced</cspace>\n" +
+                "<align=center>centred line</align>\n<align=right>right line</align>\n<indent=10%>indented line</indent>\n" +
+                "Glyphs: ▲▼◀▶ ● ○ ■ □ ★ ✓ ✗ → ← ↑ ↓ ░▒▓█ │─┼\n\n" +
+                "Links (click each):\n" +
+                "  1 <link=\"q1\">plain link q1</link>\n" +
+                "  2 <link=\"q2\"><u><color=#4af>styled link q2</color></u></link>\n" +
+                "  3 <link=q3>unquoted link q3</link>\n" +
+                "  4 <link=\"tug:queue:42\"><color=#4af>[Mark for salvage]</color></link>   <link=\"tug:cancel\"><color=#f84>[Cancel]</color></link>  (two on one line)\n" +
+                "  5 <a href=\"q5\">html anchor q5</a>\n" +
+                "  6 <link=\"q6\">▶ glyph link q6</link>";
+            var cfg = new DialogConfig
+            {
+                TitleText = "<color=#4af>Dialog</color> <b>probe</b> — mode '" + mode + "'",
+                BodyText = body,
+                ButtonTexts = new[] { "One", "Two", "Three", "Four", "Five" },   // more than 3: how many show?
+                ButtonIdxForEsc = -1,
+                CloseOnLinkClick = mode == "close",
+            };
+            if (mode == "input") { cfg.MaxChars = 40; cfg.Placeholder = "type an amount…"; cfg.InitialContent = "100"; }
+            var ok = api.Application.ShowDialogBox(pid, cfg, (b, link, input, p, cv) =>
+            {
+                var ans = $"button={b} link='{link}' input='{input}'";
+                log("dlg probe answer: " + ans);
+                Say(p, "dlg: " + ans);
+                if (!string.IsNullOrEmpty(link) && mode != "close") DialogProbe(p, mode, ans);   // re-show so link clicks can be chained
+            }, 7);
+            log($"dlg probe shown to {pid} mode='{mode}' ok={ok}");
         }
 
         void OnTraderChoice(int buttonIdx, string linkId, string input, int playerId, int customValue)

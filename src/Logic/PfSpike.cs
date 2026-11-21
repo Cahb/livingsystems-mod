@@ -51,7 +51,6 @@ namespace LivingSystems
         readonly List<Swapped> holos = new List<Swapped>();
         const string HoloName = "NPC_HOLOGRAM";
         const int TraderBlock = 1314;
-        const int NpcAdminCore = 1360;   // admin core = indestructible structure
         static readonly HashSet<int> CoreBlocks = new HashSet<int> { 558, 560, 1360, 1361, 1401, 1402 };
         readonly Stopwatch clock = Stopwatch.StartNew();
         double lastTick, lastReport;
@@ -62,6 +61,8 @@ namespace LivingSystems
     public Func<int, int, string> ShipSays;
     /// <summary>Registered as ours (by entity id, from the flight driver's registry view). Never decide ownership by name.</summary>
     public Func<int, bool> IsOurShip;
+    /// <summary>The player's own hired tug (0 = none): its own line heads the hail list, so the scan leaves it out.</summary>
+    public Func<int, int> HiredTugOf;
     /// <summary>Adds a line to the COMMS feed (flight driver's event list).</summary>
     public Action<string> FeedEvent;
 
@@ -72,68 +73,6 @@ namespace LivingSystems
         }
 
         int lastPid;
-        readonly Dictionary<int, int> kioskFix = new Dictionary<int, int>();   // kiosk id -> player to notify
-
-        // Kiosk "invulnerability" by regeneration: the block layout recorded at fit-up, restored once a second.
-        sealed class BlockRec { public VectorInt3 Pos; public int Type, Shape, Rot; }
-        readonly Dictionary<int, List<BlockRec>> kioskBlocks = new Dictionary<int, List<BlockRec>>();
-        double lastRegen;
-        readonly Dictionary<int, int> kioskTrader = new Dictionary<int, int>();             // kiosk id -> current trader NPC id
-        readonly Dictionary<int, HashSet<int>> kioskNpcs = new Dictionary<int, HashSet<int>>(); // every NPC id a kiosk ever claimed
-        readonly Dictionary<int, string> npcSig = new Dictionary<int, string>();
-        readonly Dictionary<int, Vector3> traderHome = new Dictionary<int, Vector3>();   // where each claimed trader first stood
-        readonly Dictionary<int, VectorInt3> kioskTraderCell = new Dictionary<int, VectorInt3>(); // trader block cell in the kiosk grid
-
-        /// <summary>
-        /// An NPC belongs to a kiosk only if it stands ON that kiosk's trader block (within one cell, in the kiosk's own grid).
-        /// No radius sweeps: a station's own trader nearby must never match.
-        /// </summary>
-        int? KioskOwning(IEntity npc)
-        {
-            if (npc == null || npc.Type != EntityType.Trader) return null;
-            foreach (var kv in kioskTraderCell)
-            {
-                if (!playfield.Entities.TryGetValue(kv.Key, out var k) || k?.Structure == null) continue;
-                VectorInt3 sp; try { sp = k.Structure.GlobalToStructPos(npc.Position); } catch { continue; }
-                var c = kv.Value;
-                if (Math.Abs(sp.x - c.x) <= 1 && Math.Abs(sp.z - c.z) <= 1 && sp.y >= c.y - 1 && sp.y <= c.y + 2) return kv.Key;
-            }
-            return null;
-        }
-
-        void Claim(int kioskId, IEntity npc)
-        {
-            if (!kioskNpcs.TryGetValue(kioskId, out var set)) kioskNpcs[kioskId] = set = new HashSet<int>();
-            if (!set.Add(npc.Id)) return;
-            // Name it with our tag too, so it is recognisable in game and in logs.
-            api.Network.SendToDedicatedServer(LivingSystemsMod.Channel, Wire.Pack("npcname", npc.Id, StructureTag.Apply(KioskNames.Npc)), playfield.Name);
-            log($"kiosk {kioskId}: claimed trader NPC {npc.Id} (was '{npc.Name}')");
-        }
-
-        /// <summary>A new trader on a kiosk means the previous one died (the block respawns it): remove the old body.</summary>
-        void OnTraderLoaded(IEntity npc)
-        {
-            var kid = KioskOwning(npc);
-            if (!kid.HasValue) return;
-            if (kioskTrader.TryGetValue(kid.Value, out var old) && old != npc.Id && playfield.Entities.ContainsKey(old)
-                && kioskNpcs.TryGetValue(kid.Value, out var mine) && mine.Contains(old))
-            {
-                playfield.RemoveEntity(old);
-                log($"kiosk {kid.Value}: trader {old} replaced by {npc.Id}, old body removed");
-            }
-            Claim(kid.Value, npc);
-            kioskTrader[kid.Value] = npc.Id;
-        }
-
-        /// <summary>Remove only NPC ids this kiosk claimed. Nothing else is ever touched.</summary>
-        void ClearKioskNpcs(int kioskId)
-        {
-            if (kioskNpcs.TryGetValue(kioskId, out var set))
-                foreach (var id in set)
-                    if (playfield.Entities.ContainsKey(id)) { playfield.RemoveEntity(id); log($"kiosk {kioskId}: removed its trader NPC {id}"); }
-            kioskBlocks.Remove(kioskId); kioskTrader.Remove(kioskId); kioskNpcs.Remove(kioskId); kioskTraderCell.Remove(kioskId);
-        }
-
 
         // ---- restored from our own last good build of this file after a bad scripted edit ----
     private readonly HashSet<int> spawnedV2 = new HashSet<int>();
@@ -185,11 +124,7 @@ namespace LivingSystems
         //IL_003a: Expected O, but got Unknown
         //IL_00e5: Unknown result type (might be due to invalid IL or missing references)
         playfield = pf;
-        // Nothing of ours survives a load: for the first minute, sweep kiosks and force TRADE_PAD_ACTIVATE levers OFF.
-        cleanupUntil = clock.Elapsed.TotalSeconds + 60;
-        lastSweep = 0;
-        foreach (var l in levers.Values) l.SeenSinceLoad = false;
-        log("load cleanup: kiosks swept for 60 s; trade levers ON at first sighting are reset");
+        lastSweep = 0;   // retired trade kiosks left in a save: swept (SweepOrphans)
         if (entityLoadedOn != null && entityLoaded != null)
         {
             entityLoadedOn.OnEntityLoaded -= entityLoaded;
@@ -204,10 +139,7 @@ namespace LivingSystems
                 {
                     log("entity loaded: " + Describe(e));
                 }
-                else if (e != null && (int)e.Type == 13)
-                {
-                    OnTraderLoaded(e);
-                }
+
             }
             catch (Exception ex)
             {
@@ -221,9 +153,8 @@ namespace LivingSystems
         {
             try
             {
-                if (u == null || (u.Type != EntityType.Trader && !kioskTrader.ContainsValue(u.Id))) return;
-                var mine = kioskTrader.ContainsValue(u.Id) ? " (OUR kiosk trader)" : "";
-                log($"ENTITY UNLOADED: {u.Id} '{u.Name}' {u.Type} belongsTo={Safe(() => u.BelongsTo)} at {u.Position}{mine}; still in Entities: {playfield.Entities.ContainsKey(u.Id)}");
+                if (u == null || u.Type != EntityType.Trader) return;
+                log($"ENTITY UNLOADED: {u.Id} '{u.Name}' {u.Type} belongsTo={Safe(() => u.BelongsTo)} at {u.Position}; still in Entities: {playfield.Entities.ContainsKey(u.Id)}");
             }
             catch (Exception ex) { log("OnEntityUnloaded threw: " + ex.Message); }
         };
@@ -304,15 +235,8 @@ namespace LivingSystems
         try
         {
             ApplyWantedFactions();
-            FixKiosks();
-            PollLevers();
             PollComms();
             SweepOrphans();
-            if (kioskBlocks.Count > 0 && clock.Elapsed.TotalSeconds - lastRegen >= 1.0)
-            {
-                lastRegen = clock.Elapsed.TotalSeconds;
-                RegenKiosks();
-            }
             foreach (int item in Enumerable.ToList<int>((IEnumerable<int>)reportCoreAt.Keys))
             {
                 if (!(clock.Elapsed.TotalSeconds < reportCoreAt[item]))
@@ -444,106 +368,6 @@ namespace LivingSystems
         }
     }
 
-    /// <summary>
-    /// After a kiosk copy spawns and is ready: admin core first (swapping the core RESETS the faction), then
-    /// Polaris, then the trader on top of the core (exports drop trader blocks). If it was called to a TRADE_PAD,
-    /// align it with the host ship and move it so its core sits exactly where the pad request wanted it.
-    /// Finally record the layout for regeneration.
-    /// </summary>
-    private void FixKiosks()
-    {
-        if (kioskFix.Count == 0) return;
-        foreach (var id in kioskFix.Keys.ToList())
-        {
-            if (!playfield.Entities.TryGetValue(id, out var e) || e?.Structure == null) continue;
-            var st = e.Structure;
-            bool ready; try { ready = st.IsReady; } catch { ready = false; }
-            if (!ready) continue;
-            var pid = kioskFix[id]; kioskFix.Remove(id);
-            wantFaction.Remove(id);
-
-            VectorInt3 mn, mx; try { mn = st.MinPos; mx = st.MaxPos; } catch { continue; }
-            VectorInt3? core = null;
-            for (int x = mn.x; x <= mx.x && core == null; x++)
-            for (int y = mn.y + 128; y <= mx.y + 128 && core == null; y++)
-            for (int z = mn.z; z <= mx.z && core == null; z++)
-            {
-                int t, sh, r; bool a;
-                try { st.GetBlock(x, y, z).Get(out t, out sh, out r, out a); } catch { continue; }
-                if (CoreBlocks.Contains(t)) core = new VectorInt3(x, y, z);
-            }
-            if (!core.HasValue) { log($"kiosk {id}: no core found"); Reply(pid, $"kiosk {id}: no core found"); continue; }
-
-            int ct, csh, cr; bool ca; st.GetBlock(core.Value).Get(out ct, out csh, out cr, out ca);
-            if (ct != NpcAdminCore) st.GetBlock(core.Value).Set(NpcAdminCore, null, cr, true);
-            st.SetFaction(FactionGroup.Polaris, 0);
-
-            var top = new VectorInt3(core.Value.x, core.Value.y + 1, core.Value.z);
-            int tt, tsh, tr; bool ta; st.GetBlock(top).Get(out tt, out tsh, out tr, out ta);
-            if (tt != TraderBlock) st.GetBlock(top).Set(TraderBlock, 0, tr, true);
-            kioskTraderCell[id] = top;
-            log($"kiosk {id}: core {ct}({ItemName(ct)})->admin, Polaris, trader on {top.x},{top.y},{top.z} (was {tt})");
-
-            // Pad alignment: rotate like the host, then shift so the core lands on the requested world point.
-            if (padRequest.TryGetValue(pid, out var req) && playfield.Entities.TryGetValue(req.HostId, out var host))
-            {
-                padRequest.Remove(pid);
-                e.Rotation = host.Rotation;
-                var target = req.Target;
-                try
-                {
-                    var pp = host.Structure.GetDevicePositions("TRADE_PAD");
-                    if (pp != null && pp.Count > 0) target = host.Structure.StructToGlobalPos(new VectorInt3(pp[0].x, pp[0].y + 2, pp[0].z));
-                }
-                catch { }
-                if (Vector3.Distance(target, req.Target) > 0.5f) log($"kiosk {id}: host moved {Vector3.Distance(target, req.Target):0.00} m since the request; using the current pad position");
-                req.Target = target;
-                var coreWorld = st.StructToGlobalPos(core.Value);
-                var delta = req.Target - coreWorld;
-                e.Position = e.Position + delta;
-                var after = st.StructToGlobalPos(core.Value);
-                VectorInt3 padNow = default(VectorInt3);
-                try { var pp = host.Structure.GetDevicePositions("TRADE_PAD"); if (pp != null && pp.Count > 0) padNow = pp[0]; } catch { }
-                kioskHost[id] = new HostSnap { HostId = req.HostId, Pos = host.Position, Rot = host.Rotation, Pid = pid,
-                                               Faction = host.Faction, Pad = padNow, Expires = clock.Elapsed.TotalSeconds + KioskLifetime,
-                                               PartnerId = tradePartner.TryGetValue(pid, out var pp0) ? pp0 : 0 };
-                // The shift is the prefab's pivot offset, constant in kiosk-local space: learn it so the next
-                // kiosk spawns already in place (no visible slide). Accumulate, in case the first guess was partial.
-                // (No offset learning: a ship nudged between request and fit-up polluted it and the error accumulated,
-                //  spawning kiosks inside the hull. Align fresh every time instead.)
-                log($"kiosk {id}: aligned to host {req.HostId}: shift {delta} ({delta.magnitude:0.00} m), core now {after}, target {req.Target}, error {Vector3.Distance(after, req.Target):0.00} m");
-            }
-
-            var recs = new List<BlockRec>();
-            for (int x = mn.x; x <= mx.x; x++)
-            for (int y = mn.y + 128; y <= mx.y + 128; y++)
-            for (int z = mn.z; z <= mx.z; z++)
-            {
-                int t, sh, r; bool a;
-                try { st.GetBlock(x, y, z).Get(out t, out sh, out r, out a); } catch { continue; }
-                if (t != 0) recs.Add(new BlockRec { Pos = new VectorInt3(x, y, z), Type = t, Shape = sh, Rot = r });
-            }
-            kioskBlocks[id] = recs;
-            Reply(pid, "Kiosk docked. The trader is beaming over…");
-        }
-    }
-
-    /// <summary>
-    /// Call a kiosk onto host's TRADE_PAD: space only, one per ship, 3x3x3 clear above the pad in the ship's
-    /// frame. Returns the message for the player.
-    /// </summary>
-    /// <summary>Player id -> the NPC ship/station they were approved to trade with (via hail).</summary>
-    readonly Dictionary<int, int> tradePartner = new Dictionary<int, int>();
-    const float PartnerRange = 1300f;   // kiosk ends beyond this; the Dedi approves within 1100 (hysteresis, no edge flicker)
-
-    /// <summary>NPC-owned = not a player faction and not unowned (group 0 is player factions, 1 = Player).</summary>
-    string PartnerProblem(int partnerId, IEntity host)
-    {
-        if (!playfield.Entities.TryGetValue(partnerId, out var pn) || pn == null) return "your trade partner is gone";
-        if (!IsNpcOwned(pn)) return "your trade partner changed hands";
-        if (Vector3.Distance(pn.Position, host.Position) > PartnerRange) return "your trade partner is out of range";
-        return null;
-    }
 
     /// <summary>Half the hull's bounding-box diagonal in metres (large blocks 2 m, SV blocks 0.5 m); 20 m if unknown.</summary>
     internal static float HullRadius(IEntity x)
@@ -561,44 +385,6 @@ namespace LivingSystems
     static bool IsNpcOwned(IEntity x)
     {
         try { var g = (int)x.Faction.Group; return g >= 2 && x.Faction.Group != FactionGroup.Admin; } catch { return false; }
-    }
-
-    string DeployPad(int pid, IEntity e)
-    {
-        // A kiosk is now always somebody's: the partner approved via /ls hail, still in range and still NPC-owned.
-        if (!tradePartner.TryGetValue(pid, out var partnerId) || !playfield.Entities.TryGetValue(partnerId, out var partner) || partner == null)
-            return "No trade partner. Use /ls hail, pick a ship, and Request trade first.";
-        if (!IsNpcOwned(partner)) return $"'{partner.Name}' is no longer an NPC vessel.";
-        if (Vector3.Distance(partner.Position, e.Position) > PartnerRange)
-            return $"'{partner.Name}' is {Vector3.Distance(partner.Position, e.Position):0} m away — come within {PartnerRange:0} m.";
-        if (!string.Equals(playfield.PlayfieldType, "Space", StringComparison.OrdinalIgnoreCase))
-            return $"trade kiosks only deploy in space (this is {playfield.PlayfieldType})";
-        var st = e.Structure;
-        List<VectorInt3> pads; try { pads = st.GetDevicePositions("TRADE_PAD"); } catch { pads = null; }
-        if (pads == null || pads.Count == 0) return $"no TRADE_PAD on '{e.Name}'";
-        if (KioskOfHost(e.Id).HasValue) return $"'{e.Name}' already has a kiosk alongside";
-        var pad = pads[0];
-        var blocked = new List<string>();
-        for (int dx = -1; dx <= 1; dx++)
-        for (int dy = 1; dy <= 3; dy++)
-        for (int dz = -1; dz <= 1; dz++)
-        {
-            int t, sh, r; bool a;
-            try { st.GetBlock(pad.x + dx, pad.y + dy, pad.z + dz).Get(out t, out sh, out r, out a); } catch { continue; }
-            if (t != 0 && blocked.Count < 5) blocked.Add($"{ItemName(t)} at +{dx},+{dy},+{dz}");
-        }
-        if (blocked.Count > 0) return $"TRADE_PAD on '{e.Name}' is blocked: " + string.Join("; ", blocked);
-        var world = st.StructToGlobalPos(new VectorInt3(pad.x, pad.y + 2, pad.z));
-        padRequest[pid] = new PadReq { HostId = e.Id, Target = world };
-        var eul = e.Rotation.eulerAngles;
-
-        var ci = System.Globalization.CultureInfo.InvariantCulture;
-        api.Network.SendToDedicatedServer(LivingSystemsMod.Channel,
-            Wire.Pack("padspawn", pid, world.x.ToString(ci), world.y.ToString(ci), world.z.ToString(ci), eul.x.ToString(ci), eul.y.ToString(ci), eul.z.ToString(ci)),
-            playfield.Name);
-        log($"pad: '{e.Name}' TRADE_PAD at {pad.x},{pad.y},{pad.z} -> kiosk at {world} rot {eul}");
-        FeedEvent?.Invoke($"kiosk called to {StructureTag.Strip(e.Name)}");
-        return "Hailing a trade kiosk… it docks at your TRADE_PAD, trader en route (a few seconds).";
     }
 
     const string CommsName = "COMMS";
@@ -657,135 +443,11 @@ namespace LivingSystems
         }
     }
 
-    int? KioskOfHost(int hostId)
-    {
-        foreach (var kv in kioskHost) if (kv.Value.HostId == hostId && playfield.Entities.ContainsKey(kv.Key)) return kv.Key;
-        return null;
-    }
-
-    void RemoveKiosk(int kioskId, int pid, string why)
-    {
-        log($"kiosk {kioskId}: removing, {why}");
-        FeedEvent?.Invoke("trade kiosk withdrawn");
-        kioskFix.Remove(kioskId); wantFaction.Remove(kioskId);
-        ClearKioskNpcs(kioskId); kioskHost.Remove(kioskId);
-        if (playfield.Entities.ContainsKey(kioskId)) playfield.RemoveEntity(kioskId);
-        api.Network.SendToDedicatedServer(LivingSystemsMod.Channel, Wire.Pack("kioskgone", pid, kioskId), playfield.Name);
-    }
-
-    // ---- TRADE_PAD_ACTIVATE lever: level-triggered (switch state = desired state), debounced ----
-    sealed class LeverState { public double BusyUntil; public double NextScan; public bool NeedsReset; public bool SeenSinceLoad; }
-    readonly Dictionary<int, LeverState> levers = new Dictionary<int, LeverState>();   // host id -> state
-    double lastLeverPoll, lastLeverScan;
-    readonly List<int> leverHosts = new List<int>();
-    const string LeverName = "TRADE_PAD_ACTIVATE";
-    string lastLeverHosts = "";
-    readonly Dictionary<int, bool> lastLever = new Dictionary<int, bool>();
-    readonly Dictionary<int, string> lastLeverRaw = new Dictionary<int, string>();
-
-    /// <summary>A lever/switch is a signal SENDER: its name is the signal name, not a device custom name.</summary>
-    bool HasLever(IStructure st)
-    {
-        try
-        {
-            var sigs = st.GetBlockSignals(LeverName);
-            if (sigs != null && sigs.Any(x => string.Equals(x.Name, LeverName, StringComparison.OrdinalIgnoreCase))) return true;
-            var cp = st.GetControlPanelSignals();
-            if (cp != null && cp.Any(x => string.Equals(x.Name, LeverName, StringComparison.OrdinalIgnoreCase))) return true;
-            var dev = st.GetDevicePositions(LeverName);
-            return dev != null && dev.Count > 0;
-        }
-        catch { return false; }
-    }
-    const double LeverCooldown = 5.0;
-
-    void PollLevers()
-    {
-        var now = clock.Elapsed.TotalSeconds;
-        if (now - lastLeverPoll < 0.5) return;
-        lastLeverPoll = now;
-        var inCleanup = now < cleanupUntil;
-        if (now - lastLeverScan > (inCleanup ? 2 : 5))   // rescan which structures have the lever
-        {
-            lastLeverScan = now;
-            leverHosts.Clear();
-            var players = playfield.Players?.Values.Where(p => p != null).ToList() ?? new List<IPlayer>();
-            foreach (var e in playfield.Entities.Values)
-            {
-                if (e?.Structure == null || StructureTag.IsTagged(e.Name) || e.Type == EntityType.Player) continue;
-                if (!inCleanup && !players.Any(p => Vector3.Distance(p.Position, e.Position) < 300f)) continue;
-                if (HasLever(e.Structure)) leverHosts.Add(e.Id);
-            }
-            var names = string.Join(", ", leverHosts.Select(id => playfield.Entities.TryGetValue(id, out var h) ? h.Name : id.ToString()));
-            if (names != lastLeverHosts) { lastLeverHosts = names; log($"lever scan: {leverHosts.Count} ship(s) with {LeverName}: {names}"); }
-        }
-        foreach (var hostId in leverHosts)
-        {
-            if (!playfield.Entities.TryGetValue(hostId, out var host) || host?.Structure == null) continue;
-            if (!levers.TryGetValue(hostId, out var ls)) levers[hostId] = ls = new LeverState();
-            if (now < ls.BusyUntil) continue;                         // deploying / cooling down: ignore flips
-            // Read both: the named signal, and the lever block's own switch state. Whichever follows the flips wins.
-            bool? sig = null, sw = null;
-            try { sig = host.Structure.GetSignalState(LeverName); } catch { }
-            try
-            {
-                var dp = host.Structure.GetDevicePositions(LeverName);
-                if (dp != null && dp.Count > 0) sw = host.Structure.GetBlock(dp[0]).GetSwitchState();
-            }
-            catch { }
-            var raw = $"signal={(sig.HasValue ? sig.Value.ToString() : "n/a")} switch={(sw.HasValue ? sw.Value.ToString() : "n/a")}";
-            if (!lastLeverRaw.TryGetValue(hostId, out var prevRaw) || prevRaw != raw) { lastLeverRaw[hostId] = raw; log($"lever raw on '{host.Name}': {raw}"); }
-            bool? on = (sw == true || sig == true) ? true : (sw.HasValue || sig.HasValue ? false : (bool?)null);
-            if (!on.HasValue) continue;
-            if (!lastLever.TryGetValue(hostId, out var was) || was != on.Value) { lastLever[hostId] = on.Value; log($"lever on '{host.Name}' is {(on.Value ? "ON" : "OFF")}"); }
-            if (ls.NeedsReset) { if (!on.Value) ls.NeedsReset = false; continue; }   // after a movement detach: OFF then ON again
-            // A lever is judged ONCE after a load: ON at its first sighting = stale state from the save -> OFF.
-            // Flips after that are real requests, even inside the cleanup window.
-            if (!ls.SeenSinceLoad)
-            {
-                ls.SeenSinceLoad = true;
-                if (on.Value && !KioskOfHost(hostId).HasValue) { log($"load cleanup: '{host.Name}' lever was ON from the save"); LeverOff(hostId); continue; }
-            }
-            var kiosk = KioskOfHost(hostId);
-            var deploying = padRequest.Values.Any(r => r.HostId == hostId);
-            var pid = playfield.Players.Values.Where(p => p != null).OrderBy(p => Vector3.Distance(p.Position, host.Position)).Select(p => p.Id).FirstOrDefault();
-            if (on.Value && !kiosk.HasValue && !deploying)
-            {
-                ls.BusyUntil = now + LeverCooldown;
-                var msg = DeployPad(pid, host);
-                log($"lever ON on '{host.Name}': {msg}");
-                if (pid != 0) Reply(pid, msg);
-                // Refused (no partner, too far, pad blocked, not in space...) -> lever back OFF, so its position
-                // always means "a kiosk is out or coming" and it doesn't retry/spam every cooldown.
-                if (!msg.StartsWith("Hailing a trade kiosk")) LeverOff(hostId);
-            }
-            else if (!on.Value && kiosk.HasValue)
-            {
-                ls.BusyUntil = now + LeverCooldown;
-                RemoveKiosk(kiosk.Value, pid, "lever OFF");
-                if (pid != 0) Reply(pid, "Kiosk dismissed.");
-            }
-        }
-    }
-
-
-    // Pad requests and kiosk -> host binding (a kiosk detaches when its host ship moves).
-    sealed class PadReq { public int HostId; public Vector3 Target; }
-    sealed class HostSnap { public int HostId, Pid, PartnerId; public Vector3 Pos; public Quaternion Rot; public FactionData Faction; public VectorInt3 Pad; public double Expires; }
-    readonly Dictionary<int, PadReq> padRequest = new Dictionary<int, PadReq>();
-    readonly Dictionary<int, HostSnap> kioskHost = new Dictionary<int, HostSnap>();
-    Vector3 kioskPivotLocal = Vector3.zero;
-    const double KioskLifetime = 15 * 60;
-    readonly HashSet<int> everKiosk = new HashSet<int>();
-    double cleanupUntil;
     EntityDelegate entityUnloaded;
-    IPlayfield entityUnloadedOn;   // after a playfield load / logic reload: stale state from the save is cleaned, not acted on   // every kiosk id we spawned, alive or not
+    IPlayfield entityUnloadedOn;
     double lastSweep;
 
-    /// <summary>
-    /// Orphans: a «LS» kiosk we are not tracking, or a trader NPC whose BelongsTo is a kiosk WE spawned that no
-    /// longer exists (e.g. dismissed before its NPC appeared). Nothing else is ever touched.
-    /// </summary>
+    /// <summary>The trade kiosk is retired: any «LS» kiosk left in a save (and the trader NPC aboard it) is removed.</summary>
     void SweepOrphans()
     {
         var now = clock.Elapsed.TotalSeconds;
@@ -793,129 +455,13 @@ namespace LivingSystems
         lastSweep = now;
         foreach (var e in playfield.Entities.Values.ToList())
         {
-            if (e == null) continue;
-            if (KioskNames.IsKiosk(e.Name) && !kioskHost.ContainsKey(e.Id) && !kioskFix.ContainsKey(e.Id) && !kioskBlocks.ContainsKey(e.Id))
-            {
-                log($"sweep: untracked kiosk {e.Id}, removing");
-                everKiosk.Add(e.Id);   // so its NPC (BelongsTo = this id) is swept next round even if we never claimed it
-                ClearKioskNpcs(e.Id); playfield.RemoveEntity(e.Id);
-                api.Network.SendToDedicatedServer(LivingSystemsMod.Channel, Wire.Pack("kioskgone", 0, e.Id), playfield.Name);
-                continue;
-            }
-            if (e.Type == EntityType.Trader && int.TryParse(Safe(() => e.BelongsTo), out var owner) && everKiosk.Contains(owner) && !playfield.Entities.ContainsKey(owner))
-            {
-                log($"sweep: trader {e.Id} '{e.Name}' belonged to vanished kiosk {owner}, removing");
-                playfield.RemoveEntity(e.Id);
-            }
+            if (e == null || !KioskNames.IsKiosk(e.Name)) continue;
+            log($"sweep: leftover trade kiosk {e.Id}, removing");
+            foreach (var n in playfield.Entities.Values.Where(x => x != null && x.Type == EntityType.Trader && Safe(() => x.BelongsTo) == e.Id.ToString()).ToList()) playfield.RemoveEntity(n.Id);
+            playfield.RemoveEntity(e.Id);
+            api.Network.SendToDedicatedServer(LivingSystemsMod.Channel, Wire.Pack("kioskgone", 0, e.Id), playfield.Name);
         }
     }
-
-    /// <summary>Keep the lever honest: whenever a kiosk goes away for any reason other than the lever, flip it OFF.</summary>
-    void LeverOff(int hostId)
-    {
-        if (!playfield.Entities.TryGetValue(hostId, out var host) || host?.Structure == null) return;
-        try
-        {
-            var dp = host.Structure.GetDevicePositions(LeverName);
-            if (dp != null && dp.Count > 0) { host.Structure.GetBlock(dp[0]).SetSwitchState(false); log($"lever on '{host.Name}' flipped OFF by the mod"); }
-        }
-        catch (Exception ex) { log("LeverOff threw: " + ex.Message); }
-        if (levers.TryGetValue(hostId, out var ls)) { ls.NeedsReset = false; ls.BusyUntil = clock.Elapsed.TotalSeconds + LeverCooldown; }
-    }   // learned correction from requested core point to spawn point, kiosk-local
-
-        void RegenKiosks()
-        {
-            foreach (var id in kioskBlocks.Keys.ToList())
-            {
-                if (!playfield.Entities.TryGetValue(id, out var e) || e?.Structure == null) { kioskBlocks.Remove(id); continue; }
-                if (!kioskTrader.ContainsKey(id))
-                {
-                    var first = playfield.Entities.Values.FirstOrDefault(x => x != null && x.Type == EntityType.Trader && KioskOwning(x) == id);
-                    if (first != null) { kioskTrader[id] = first.Id; Claim(id, first); }
-                }
-                // Detach when the host ship moved/turned (or vanished): the kiosk does not follow ships.
-                if (kioskHost.TryGetValue(id, out var hs))
-                {
-                    string why = null;
-                    if (!playfield.Entities.TryGetValue(hs.HostId, out var host) || host == null || host.Structure == null) why = "your ship is gone";
-                    else if (Vector3.Distance(host.Position, hs.Pos) > 3f) why = $"your ship moved {Vector3.Distance(host.Position, hs.Pos):0} m";
-                    else if (Quaternion.Angle(host.Rotation, hs.Rot) > 3f) why = $"your ship turned {Quaternion.Angle(host.Rotation, hs.Rot):0}°";
-                    else if (host.Faction.Group != hs.Faction.Group || host.Faction.Id != hs.Faction.Id) why = "your ship changed hands (core lost?)";
-                    else if (clock.Elapsed.TotalSeconds > hs.Expires) why = "the kiosk's time is up";
-                    else if (hs.PartnerId != 0) why = PartnerProblem(hs.PartnerId, host);
-                    else
-                    {
-                        List<VectorInt3> pp = null; try { pp = host.Structure.GetDevicePositions("TRADE_PAD"); } catch { }
-                        if (pp == null || pp.Count == 0) why = "your TRADE_PAD is gone";
-                        else if (pp[0].x != hs.Pad.x || pp[0].y != hs.Pad.y || pp[0].z != hs.Pad.z) why = "your TRADE_PAD moved";
-                        else if (leverHosts.Contains(hs.HostId) && !HasLever(host.Structure)) why = "your trade lever is gone";
-                    }
-                    if (why != null)
-                    {
-                        log($"kiosk {id}: detaching, {why}");
-                        LeverOff(hs.HostId);
-                        ClearKioskNpcs(id); kioskHost.Remove(id);
-                        playfield.RemoveEntity(id);
-                        api.Network.SendToDedicatedServer(LivingSystemsMod.Channel, Wire.Pack("kioskgone", hs.Pid, id), playfield.Name);
-                        Reply(hs.Pid, $"Kiosk detached: {why}.");
-                        continue;
-                    }
-                }
-                // Trader death ends the call: hostile action means no trade. No health getter in the API, so "dead" =
-                // gone, not a Trader any more, no longer belongs to this kiosk, or moved >1.2 m from where it stood
-                // (a living trader stays put; a corpse ragdolls and falls).
-                if (kioskTrader.TryGetValue(id, out var liveId))
-                {
-                    string dead = null;
-                    if (!playfield.Entities.TryGetValue(liveId, out var npcNow) || npcNow == null) dead = "trader gone";
-                    else if (npcNow.Type != EntityType.Trader) dead = $"trader type now {npcNow.Type}";
-                    else if (Safe(() => npcNow.BelongsTo) != id.ToString()) dead = $"trader belongsTo {Safe(() => npcNow.BelongsTo)}";
-                    // (Position is NOT a death signal: live traders hop ~1.6 m on their own, corpses stay put. Verified.)
-                    if (dead != null)
-                    {
-                        var who = kioskHost.TryGetValue(id, out var hsd) ? hsd.Pid : lastPid;
-                        log($"kiosk {id}: ending call, {dead}");
-                        ClearKioskNpcs(id); kioskHost.Remove(id);
-                        playfield.RemoveEntity(id);
-                        api.Network.SendToDedicatedServer(LivingSystemsMod.Channel, Wire.Pack("kioskgone", who, id), playfield.Name);
-                        Reply(who, "You opened fire on the trader. The kiosk withdraws.");
-                        continue;
-                    }
-                }
-                // Diagnostic: what changes on a trader NPC when it dies? (API has no health getter.)
-                if (kioskTrader.TryGetValue(id, out var tid))
-                {
-                    string sig;
-                    if (!playfield.Entities.TryGetValue(tid, out var npc) || npc == null) sig = "GONE from Entities";
-                    else sig = $"type={npc.Type} name='{npc.Name}' proxy={Safe(() => npc.IsProxy)} local={Safe(() => npc.IsLocal)} belongsTo={Safe(() => npc.BelongsTo)} pos={npc.Position}";
-                    if (kioskTraderCell.TryGetValue(id, out var cell))
-                    {
-                        try
-                        {
-                            var tb = e.Structure.GetBlock(cell); int bt, bs, br; bool ba; tb.Get(out bt, out bs, out br, out ba);
-                            sig += $" | block type={bt} active={ba} dmg={Safe(() => tb.GetDamage())} hp={Safe(() => tb.GetHitPoints())}";
-                        }
-                        catch (Exception ex) { sig += " | block read failed: " + ex.Message; }
-                    }
-                    if (!npcSig.TryGetValue(tid, out var prev) || prev != sig) { npcSig[tid] = sig; log($"kiosk {id}: trader {tid} {sig}"); }
-                }
-                var st = e.Structure; int healed = 0, rebuilt = 0;
-                FactionGroup fg; try { fg = e.Faction.Group; } catch { fg = FactionGroup.Polaris; }
-                if (fg != FactionGroup.Polaris) { st.SetFaction(FactionGroup.Polaris, 0); log($"kiosk {id}: faction was {fg}, re-set Polaris"); }
-                foreach (var b in kioskBlocks[id])
-                {
-                    try
-                    {
-                        var blk = st.GetBlock(b.Pos);
-                        int t, sh, r; bool a; blk.Get(out t, out sh, out r, out a);
-                        if (t != b.Type) { blk.Set(b.Type, b.Shape, b.Rot, true); rebuilt++; }
-                        else if (blk.GetDamage() > 0) { blk.SetDamage(0); healed++; }
-                    }
-                    catch { }
-                }
-                if (healed + rebuilt > 0) log($"kiosk {id}: regen healed {healed}, rebuilt {rebuilt}");
-            }
-        }
 
         void ApplyWantedFactions()
         {
@@ -977,6 +523,84 @@ namespace LivingSystems
                         byItem[st.id] = (byItem.TryGetValue(st.id, out var n) ? n : 0) + st.count;
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Asteroid probe. list [r] — entities within r m (default 3000) that aren't ships: type, structure or not, bounds ·
+        /// add &lt;size&gt; — IPlayfield.AddVoxelArea 40 m ahead of you (undocumented: hole? fill? nothing?) · move &lt;areaId&gt; —
+        /// MoveVoxelArea to 40 m ahead · remove &lt;areaId&gt; · kill &lt;id&gt; — RemoveEntity on it (the "mined out" fallback).
+        /// </summary>
+        void RockProbe(int pid, string[] args)
+        {
+            var sub = args.Length > 0 ? args[0] : "list";
+            var me = PlayerPos(pid);
+            Vector3 Ahead()
+            {
+                var p = playfield.Players.TryGetValue(pid, out var pl) ? pl : null;
+                var rot = p?.DrivingEntity != null ? p.DrivingEntity.Rotation : (p != null ? p.Rotation : Quaternion.identity);
+                return (me ?? Vector3.zero) + rot * Vector3.forward * 40f;
+            }
+            int Arg(int i, int def) => args.Length > i && int.TryParse(args[i], out var v) ? v : def;
+            switch (sub)
+            {
+                case "list":
+                {
+                    var r = Arg(1, 3000);
+                    var hits = playfield.Entities.Values.Where(e => e != null && e.Type != EntityType.CV && e.Type != EntityType.SV && e.Type != EntityType.HV
+                                                                    && e.Type != EntityType.Player && me.HasValue && (e.Position - me.Value).magnitude <= r)
+                                                       .OrderBy(e => (e.Position - me.Value).magnitude).Take(15).ToList();
+                    foreach (var e in hits)
+                    {
+                        var st = e.Structure;
+                        var line = $"{e.Id} '{e.Name}' {e.Type} {(e.Position - me.Value).magnitude:0} m, structure={(st != null ? "yes" : "no")}" +
+                                   (st != null ? $" blocks={Safe(() => st.BlockCount)} bounds={Safe(() => st.MinPos)}..{Safe(() => st.MaxPos)}" : "");
+                        log("rock " + line); Reply(pid, line);
+                    }
+                    if (hits.Count == 0) Reply(pid, $"nothing but ships within {r} m");
+                    break;
+                }
+                case "add":
+                {
+                    var at = Ahead(); var size = Arg(1, 5);
+                    var ground = playfield.GetTerrainHeightAt(at.x, at.z);   // planets: snap to the ground 40 m ahead (space: no terrain)
+                    if (!float.IsNaN(ground) && !float.IsInfinity(ground) && Math.Abs(ground) > 0.01f && args.Length < 3) at.y = ground;
+                    var id = playfield.AddVoxelArea(at, size);
+                    log($"rock add: AddVoxelArea({at}, {size}) → {id}"); Reply(pid, $"AddVoxelArea size {size} at 40 m ahead → id {id}. Look for a change; /ls rock move {id} | remove {id}");
+                    break;
+                }
+                case "move":
+                {
+                    var ok = playfield.MoveVoxelArea(Arg(1, -1), Ahead());
+                    log($"rock move {Arg(1, -1)} → {ok}"); Reply(pid, $"MoveVoxelArea {Arg(1, -1)} to 40 m ahead → {ok}");
+                    break;
+                }
+                case "remove":
+                {
+                    var ok = playfield.RemoveVoxelArea(Arg(1, -1));
+                    log($"rock remove {Arg(1, -1)} → {ok}"); Reply(pid, $"RemoveVoxelArea {Arg(1, -1)} → {ok}");
+                    break;
+                }
+                case "kill":
+                {
+                    var id = Arg(1, -1);
+                    if (!playfield.Entities.TryGetValue(id, out var e) || e == null) { Reply(pid, $"no entity {id} here"); break; }
+                    if (e.Type == EntityType.CV || e.Type == EntityType.SV || e.Type == EntityType.HV || e.Type == EntityType.Player) { Reply(pid, "that's a ship — not with this probe"); break; }
+                    var what = $"{id} '{e.Name}' ({e.Type})";   // read before: the entity is dead after RemoveEntity
+                    playfield.RemoveEntity(id);
+                    log($"rock kill: RemoveEntity {what}"); Reply(pid, $"RemoveEntity {what} sent — gone? Back after a reload?");
+                    break;
+                }
+                case "height":
+                {   // landing probe: the terrain height under you and under the spot 40 m ahead (planets)
+                    var a = Ahead();
+                    var h0 = me.HasValue ? playfield.GetTerrainHeightAt(me.Value.x, me.Value.z) : float.NaN;
+                    var h1 = playfield.GetTerrainHeightAt(a.x, a.z);
+                    var line = $"terrain under you {h0:0.0} (you at y {me?.y:0.0}, {me?.y - h0:0.0} m up); 40 m ahead {h1:0.0} — playfield '{playfield.Name}' type {playfield.PlayfieldType}";
+                    log("rock " + line); Reply(pid, line);
+                    break;
+                }
+                default: Reply(pid, "/ls rock list [r] | add <size> | move <areaId> | remove <areaId> | kill <id> | height"); break;
             }
         }
 
@@ -1086,7 +710,14 @@ namespace LivingSystems
                         .Where(x => x?.Structure != null && (x.Type == EntityType.CV || x.Type == EntityType.SV || x.Type == EntityType.BA)
                                     && !KioskNames.IsKiosk(x.Name) && (IsNpcOwned(x) || (IsOurShip?.Invoke(x.Id) ?? false)))   // ours (by id): listed in any faction
                         .Select(x => new { x, d = Vector3.Distance(me, x.Position) })
-                        .Where(t => t.d <= 5000f).OrderBy(t => t.d).ToList();
+                        .Where(t => t.d <= 5000f && t.x.Id != (HiredTugOf?.Invoke(pid) ?? 0)).OrderBy(t => t.d).ToList();
+                    // what the scan leaves out within 5 km, and why (a cut POI once vanished from the list: this says which rule)
+                    var shown = new HashSet<int>(list.Select(t => t.x.Id));
+                    var skipped = playfield.Entities.Values
+                        .Where(x => x != null && x.Id != pid && !shown.Contains(x.Id) && x.Type != EntityType.Player && x.Type != EntityType.Proxy && Vector3.Distance(me, x.Position) <= 5000f)
+                        .Select(x => $"{x.Id} '{Safe(() => x.Name)}' type={x.Type} group={Safe(() => ((int)x.Faction.Group).ToString())} structure={(x.Structure != null ? "yes" : "null")}{(x.Id == (HiredTugOf?.Invoke(pid) ?? 0) ? " (your tug)" : "")}")
+                        .Take(12).ToList();
+                    if (skipped.Count > 0) log($"hail: left out for {pid}: {string.Join("; ", skipped)}");
                     // target by nose: the closest of OUR ships within ~15° of where you're pointing goes first, flagged —
                     // the Dedi opens it straight away instead of the contacts pager
                     var facing = (pl.DrivingEntity != null ? pl.DrivingEntity.Rotation : pl.Rotation) * Vector3.forward;
@@ -1098,50 +729,12 @@ namespace LivingSystems
                     var nose = aimed.Count > 0 && aimed[0].off <= 15f ? aimed[0].t : null;
                     if (aimed.Count > 0) log($"hail aim {pid}: {StructureTag.Strip(aimed[0].t.x.Name)} {aimed[0].t.d:0} m, {aimed[0].off:0.0}° off (hull allowance incl.) -> {(nose != null ? "opened" : "contacts list")}");
                     if (nose != null) { list.Remove(nose); list.Insert(0, nose); }
-                    list = list.Take(5).ToList();
+                    list = list.Take(8).ToList();
                     var fields = new List<object> { "hailist", pid };
                     foreach (var t in list)
                         fields.Add($"{t.x.Id}~{t.x.Name.Replace("~", "-").Replace("|", "/")}~{(int)t.x.Faction.Group}~{t.x.Faction.Id}~{t.d:0}~{(withTrader.Contains(t.x.Id) ? 1 : 0)}~{t.x.Type}~{Safe(() => t.x.Structure.BlockCount)}~{Safe(() => t.x.Structure.CoreType)}~{(ShipStatus?.Invoke(t.x.Id, pid) ?? "").Replace("~", "-").Replace("|", "/")}~{(ShipSays?.Invoke(t.x.Id, pid) ?? "").Replace("~", "-").Replace("|", "/")}~{(t == nose ? 1 : 0)}");
                     api.Network.SendToDedicatedServer(LivingSystemsMod.Channel, Wire.Pack(fields.ToArray()), playfield.Name);
                     log($"hail: {list.Count} contacts for {pid}");
-                    break;
-                }
-                case "partner":
-                    // Dedi approved a trade: bind this player's next kiosk to that partner.
-                    if (args.Length >= 1 && int.TryParse(args[0], out var partnerId))
-                    {
-                        tradePartner[pid] = partnerId; log($"partner for {pid}: {partnerId}");
-                        var pn = playfield.Entities != null && playfield.Entities.TryGetValue(partnerId, out var pe) && pe != null ? StructureTag.Strip(pe.Name) : partnerId.ToString();
-                        FeedEvent?.Invoke($"trade approved: {pn}");
-                    }
-                    break;
-                case "padinfo":
-                {
-                    // What exactly is the TRADE_PAD block (and what's around it)? Type id/name, shape, rotation, colours, textures.
-                    if (!playfield.Players.TryGetValue(pid, out var pl) || pl == null) { Reply(pid, "can't find you"); return; }
-                    foreach (var e in playfield.Entities.Values)
-                    {
-                        var st = e?.Structure; if (st == null || e.Id == pid || StructureTag.IsTagged(e.Name)) continue;
-                        if (Vector3.Distance(e.Position, pl.Position) > 300f) continue;
-                        List<VectorInt3> pads; try { pads = st.GetDevicePositions("TRADE_PAD"); } catch { continue; }
-                        if (pads == null || pads.Count == 0) continue;
-                        var pad = pads[0];
-                        string Desc(VectorInt3 c)
-                        {
-                            var b = st.GetBlock(c); int t, sh, r; bool a; b.Get(out t, out sh, out r, out a);
-                            if (t == 0) return "air";
-                            int ct, cb, cn, cs, cw, ce; b.GetColors(out ct, out cb, out cn, out cs, out cw, out ce);
-                            int tt, tb, tn, ts, tw, te; b.GetTextures(out tt, out tb, out tn, out ts, out tw, out te);
-                            return $"{ItemName(t)} (id {t}) shape={sh} rot={r} active={a} name='{Safe(() => b.CustomName)}' colours[t,b,n,s,w,e]={ct},{cb},{cn},{cs},{cw},{ce} tex={tt},{tb},{tn},{ts},{tw},{te}";
-                        }
-                        var lines = new List<string> { $"pad at {pad.x},{pad.y},{pad.z}: {Desc(pad)}" };
-                        foreach (var d in new[] { new VectorInt3(0, -1, 0), new VectorInt3(0, 1, 0), new VectorInt3(1, 0, 0), new VectorInt3(-1, 0, 0), new VectorInt3(0, 0, 1), new VectorInt3(0, 0, -1) })
-                            lines.Add($"  {d.x:+0;-0;0},{d.y:+0;-0;0},{d.z:+0;-0;0}: {Desc(new VectorInt3(pad.x + d.x, pad.y + d.y, pad.z + d.z))}");
-                        foreach (var l in lines) log("padinfo " + l);
-                        Reply(pid, lines[0]);
-                        return;
-                    }
-                    Reply(pid, "no TRADE_PAD within 300 m");
                     break;
                 }
                 case "purge":
@@ -1150,7 +743,6 @@ namespace LivingSystems
                     var mine = playfield.Entities.Values.Where(x => x != null && x.Structure != null && StructureTag.IsTagged(x.Name)).ToList();
                     foreach (var x in mine)
                     {
-                        ClearKioskNpcs(x.Id); kioskHost.Remove(x.Id); kioskFix.Remove(x.Id);
                         playfield.RemoveEntity(x.Id);
                         api.Network.SendToDedicatedServer(LivingSystemsMod.Channel, Wire.Pack("kioskgone", pid, x.Id), playfield.Name);
                     }
@@ -1158,20 +750,11 @@ namespace LivingSystems
                     Reply(pid, $"purged {mine.Count} «LS» structures here (also destroyed globally)");
                     break;
                 }
-                case "kioskoff":
-                    if (args.Length >= 1 && int.TryParse(args[0], out var koid))
-                    {
-                        if (kioskHost.TryGetValue(koid, out var kh)) LeverOff(kh.HostId);
-                        RemoveKiosk(koid, pid, "kiosk off");
-                    }
-                    break;
-                case "kioskfix":
-                    if (args.Length >= 1 && int.TryParse(args[0], out var kfid)) { kioskFix[kfid] = pid; everKiosk.Add(kfid); log($"will fit trader on kiosk {kfid} when ready"); }
-                    break;
                 case "wantfaction":
                     if (args.Length >= 3 && int.TryParse(args[0], out var wid) && byte.TryParse(args[1], out var wg) && int.TryParse(args[2], out var wf))
                     { wantFaction[wid] = new KeyValuePair<byte, int>(wg, wf); log($"will SetFaction({(FactionGroup)wg}, {wf}) on {wid} when ready"); }
                     break;
+                case "rock": RockProbe(pid, args); break;
                 case "scan":
                 {
                     var me = PlayerPos(pid);
@@ -1270,7 +853,6 @@ namespace LivingSystems
                     break;
                 }
                 case "record":
-                case "makekiosk":
                 {
                     // Target: explicit id, else the nearest structure within 150 m that is not ours and not a player.
                     if (!playfield.Players.TryGetValue(pid, out var pl) || pl == null) { Reply(pid, "can't find you"); return; }
@@ -1299,41 +881,9 @@ namespace LivingSystems
                     log($"record {target.Id} '{target.Name}' {target.Type} bounds {mn.x},{mn.y},{mn.z}..{mx.x},{mx.y},{mx.z}: {blocks.Count} blocks");
                     foreach (var b in blocks) log("  " + b);
 
-                    if (verb == "record")
-                    {
-                        Reply(pid, $"{target.Id} '{target.Name}' {target.Type}: {blocks.Count} blocks, core {(core.HasValue ? $"{ItemName(coreType)} at {core.Value.x},{core.Value.y},{core.Value.z}" : "NOT FOUND")}. Full dump in playfield log.");
-                        return;
-                    }
 
-                    // makekiosk: core -> NPC admin core, block on top of the core (the seat) -> Trader, then export.
-                    if (!core.HasValue) { Reply(pid, "no core found, can't make a kiosk"); return; }
-                    var c = core.Value;
-                    st.GetBlock(c).Set(NpcAdminCore, null, coreRot, true);
-                    var top = new VectorInt3(c.x, c.y + 1, c.z);
-                    int tt, tsh, tr; bool ta; st.GetBlock(top).Get(out tt, out tsh, out tr, out ta);
-                    st.GetBlock(top).Set(TraderBlock, 0, tr, true);
-                    int nc, ncs, ncr; bool nca; st.GetBlock(c).Get(out nc, out ncs, out ncr, out nca);
-                    int nt, nts, ntr; bool nta; st.GetBlock(top).Get(out nt, out nts, out ntr, out nta);
-                    log($"makekiosk {target.Id}: core {coreType}->{nc} at {c.x},{c.y},{c.z}; top {tt}({ItemName(tt)})->{nt} at {top.x},{top.y},{top.z}");
-                    // Ask the Dedi to export it into the mod's prefabs folder.
-                    api.Network.SendToDedicatedServer(LivingSystemsMod.Channel, Wire.Pack("export", pid, target.Id, (int)target.Type), playfield.Name);
-                    Reply(pid, $"kiosk made from {target.Id}: core {ItemName(coreType)}->{ItemName(nc)}, top {ItemName(tt)}->{ItemName(nt)}. Exporting as LS_Kiosk…");
+                    Reply(pid, $"{target.Id} '{target.Name}' {target.Type}: {blocks.Count} blocks, core {(core.HasValue ? ItemName(coreType) : "NOT FOUND")}. Full dump in playfield log.");
                     return;
-                }
-                case "pad":
-                {
-                    if (!playfield.Players.TryGetValue(pid, out var pl) || pl == null) { Reply(pid, "can't find you"); return; }
-                    foreach (var e in playfield.Entities.Values)
-                    {
-                        var st = e?.Structure; if (st == null || e.Id == pid || StructureTag.IsTagged(e.Name)) continue;
-                        if (Vector3.Distance(e.Position, pl.Position) > 300f) continue;
-                        List<VectorInt3> pads; try { pads = st.GetDevicePositions("TRADE_PAD"); } catch { continue; }
-                        if (pads == null || pads.Count == 0) continue;
-                        Reply(pid, DeployPad(pid, e));
-                        return;
-                    }
-                    Reply(pid, "no device named TRADE_PAD on any structure within 300 m");
-                    break;
                 }
                 case "find":
                 {

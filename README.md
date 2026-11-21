@@ -44,6 +44,7 @@ is measured from position changes, and each hull's real thrust per axis is learn
 - `src/Logic` — Dedi and playfield-server code (spawning, flight, live ships, dialogs, trade, LCDs).
 - `src/Core` — pure C#, no game types: the offline simulation, flight maths, rules.
 - `tests/Core.Tests` — xUnit tests of Core.
+- `changelog/` — what each snapshot added, high level.
 
 ## Build
 

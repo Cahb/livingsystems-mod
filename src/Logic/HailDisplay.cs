@@ -36,7 +36,7 @@ namespace LivingSystems
         public HailDisplay(Action<string> log, FlightDriver fly) { this.log = log; this.fly = fly; }
 
         /// <summary>Sim traders' transponders here (SimLive): name, position, leg, other system, station.</summary>
-        public Func<IEnumerable<SimLive.Transponder>> Traffic;
+        public Func<int, IEnumerable<SimLive.Transponder>> Traffic;   // arg: whose band (a player id, or −ship id for its LCD)
 
         public void OnLoaded(IPlayfield p) { playfield = p; hosts.Clear(); lastText.Clear(); nextScan = 0; nextDraw = 0; }
         public void OnUnloading(IPlayfield p) { if (playfield == p) { playfield = null; hosts.Clear(); lastText.Clear(); } }
@@ -189,9 +189,14 @@ namespace LivingSystems
             }
             v.Contacts = v.All.Count;
             List<SimLive.Transponder> band;
-            try { band = Traffic?.Invoke()?.ToList() ?? new List<SimLive.Transponder>(); } catch { band = new List<SimLive.Transponder>(); }
+            try { band = Traffic?.Invoke(-host.Id)?.ToList() ?? new List<SimLive.Transponder>(); } catch { band = new List<SimLive.Transponder>(); }
             foreach (var t in band)
             {
+                if (t.IsGhost)
+                {   // a ghost ping is no ship you can see or hail: its own faint row, never matched to a real contact
+                    v.All.Add(new Seen { Key = "g" + t.Name, Name = t.Name, Pos = t.Pos, Dist = (t.Pos - host.Position).magnitude, T = t, Kind = 2 });
+                    continue;
+                }
                 // the transponder name may carry a call sign ("Silk Globe #4F2A"): match on the ship's name in front
                 var match = v.All.FirstOrDefault(x => x.T == null && !x.Station && x.Key.StartsWith("e") && (t.Name == x.Name || t.Name.StartsWith(x.Name + " ") || x.Name.StartsWith(t.Name + " ")));
                 if (match == null)
@@ -442,11 +447,12 @@ namespace LivingSystems
                     case "arriving": what = $"<color=#4FC3F7>ARRIVING</color> {Math.Max(0, t.EtaSec) / 60:0.0}m"; break;
                     case "wreck": what = $"<color=#FFB300>WRECK</color> {t.AgeMin:0}m"; break;
                     case "home": what = "<color=#EF5350>HUB</color> " + Clip(t.Other, 9); break;
+                    case "ghost": what = $"<color=#90A4AE>faint {(t.HeardAgo < 60 ? "ping" : $"{t.HeardAgo / 60:0}m ago")}</color>"; break;
                     default: what = "<color=#4F87A6>docked" + (t.EtaSec > 0 ? $" {Math.Max(1, Math.Ceiling(t.EtaSec / 60)):0}m" : "") + "</color>"; break;
                 }
                 var where = t.Leg == "dock" || t.Leg == "arriving" ? Pad("", 16) : $"<color=#4F87A6>{Pad(Km(x.Dist), 5)}</color> <color=#FFD54F>{Pad(Dir(x.Local), 10)}</color>";
                 var hull = t.IsWreck || t.Hull >= 0.95f ? "" : $" <color={(t.Hull >= 0.35f ? "#FFB300" : "#EF5350")}>{t.Hull * 100:0}%</color>";
-                var cargo = t.Amt > 0 ? $"{Abbrev(t.Cargo)}{t.Amt}" : "empty";
+                var cargo = t.IsGhost ? "" : t.Amt > 0 ? $"{Abbrev(t.Cargo)}{t.Amt}" : "empty";
                 sb.Append($"<color={x.Color}>{x.Letter}</color> {Pad(Clip(x.Name, 11), 11)} {where} {what}{hull} <color=#607D8B>{Clip(t.Role, 6)} {cargo}</color>\n");
             }
             if (band.Count > 14) sb.Append($"<color=#4F87A6>  +{band.Count - 14} more</color>");
@@ -563,7 +569,7 @@ namespace LivingSystems
         {
             var from = host.Position;
             List<SimLive.Transponder> all;
-            try { all = Traffic?.Invoke()?.ToList() ?? new List<SimLive.Transponder>(); }
+            try { all = Traffic?.Invoke(-host.Id)?.ToList() ?? new List<SimLive.Transponder>(); }
             catch { all = new List<SimLive.Transponder>(); }
             sb.Append("<b><color=#4FC3F7>TRAFFIC</color></b>  <color=#4F87A6>transponders</color>\n");
             if (all.Count == 0) { sb.Append("<color=#4F87A6>  no transponders on the band</color>"); return; }
@@ -581,12 +587,13 @@ namespace LivingSystems
                     case "arriving": what = $"<color=#4FC3F7>ARRIVING</color> <color=#4F87A6>{Math.Max(0, t.EtaSec) / 60:0.0} min</color>"; break;
                     case "wreck": what = $"<color=#FFB300>WRECK</color> <color=#4F87A6>{t.AgeMin:0} min</color>"; break;
                     case "home": what = $"<color=#EF5350>HUB</color> {Clip(t.Other, 14)}"; break;   // test phase (SimLive.ShowHubs)
+                    case "ghost": what = $"<color=#90A4AE>faint ping{(t.HeardAgo < 60 ? "" : $", {t.HeardAgo / 60:0} min ago")}</color>"; break;
                     default: what = $"<color=#4F87A6>docked at {Clip(t.Station, 14)}{(t.EtaSec > 0 ? $", out {Math.Max(1, Math.Ceiling(t.EtaSec / 60)):0} min" : "")}</color>"; break;
                 }
                 var where = t.Leg == "dock" ? "" : $"<color=#4F87A6>{Dist(x.d.magnitude)}</color> <color=#FFD54F>{dir}</color> ";
                 var hc = t.Hull >= 0.7f ? "#66BB6A" : t.Hull >= 0.35f ? "#FFB300" : "#EF5350";
-                var hull = t.IsWreck ? "" : $"<color={hc}>[{t.Hull * 100:0}%]</color> ";
-                sb.Append($"<color=#A1887F>{(t.IsWreck ? "✕" : "●")}</color> <b>{Clip(t.Name, 12)}</b> {hull}{where}{what} <color=#4F87A6>{Clip(t.What, 28)}</color>\n");
+                var hull = t.IsWreck || t.IsGhost ? "" : $"<color={hc}>[{t.Hull * 100:0}%]</color> ";
+                sb.Append($"<color=#A1887F>{(t.IsWreck ? "✕" : t.IsGhost ? "·" : "●")}</color> <b>{Clip(t.Name, 12)}</b> {hull}{where}{what} <color=#4F87A6>{Clip(t.IsGhost ? t.Role + ", lost" : t.What, 28)}</color>\n");
             }
             if (rows.Count > TrafficLines) sb.Append($"<color=#4F87A6>  +{rows.Count - TrafficLines} more</color>");
         }

@@ -17,7 +17,7 @@ namespace LivingSystems.Core
 
         public static readonly string[] Verbs =
             { "help", "spawn", "move", "stop", "clear", "list", "dialog", "info", "factions", "faction", "goto", "follow",
-              "trade", "scan", "cargo", "items", "perf", "npc", "traderblock", "heal", "holo", "tp", "find", "spawn2", "kit", "record", "makekiosk", "kiosk", "pad", "purge", "padinfo", "gsinfo", "hail", "comms", "fine", "fly", "movepf", "sim" };
+              "trade", "scan", "cargo", "items", "perf", "npc", "traderblock", "heal", "holo", "tp", "find", "spawn2", "record", "purge", "gsinfo", "hail", "comms", "fine", "fly", "movepf", "sim", "dlg", "gstats", "gdestroy", "rock" };
 
         /// <summary>Movement modes the spike compares (PLAN.md §4a Q1).</summary>
         public static readonly string[] MoveModes = { "fwd", "fwdtick", "move", "pos", "lfwd", "lup" };
@@ -111,18 +111,18 @@ namespace LivingSystems.Core
                            "/ls fly probe — log the next spawned ship's state until it obeys | /ls fly idle auto|brake|coast. " +
                            "Fresh ships ignore steering for ~16 s after spawning; push gains are learned per ship.";
                 case "trade":
-                    return "/ls hail or /comms or the COMMS button — contacts in range, hail one | lever TRADE_PAD_ACTIVATE ON — kiosk docks on TRADE_PAD | " +
-                           "/ls kiosk [off] | /ls pad | /ls padinfo | /ls trade sell|buy [item count]... | /ls items <filter>. See /ls help names.";
+                    return "/ls hail or /comms or the COMMS button — contacts in range, hail one (our traders open their hold within 1.1 km) | " +
+                           "/ls trade sell|buy [item count]... | /ls items <filter>. See /ls help names.";
                 case "spawn":
                     return "/ls spawn [prefab] [count 1-10] [polaris|zirax|talon] [BA|CV|SV|HV|auto] [distance=80] | /ls spawn2 <prefab> [distance] | " +
                            "/ls list | /ls info | /ls clear (removes «LS» ships) | /ls faction <name|group:id> | /ls factions";
                 case "admin":
-                    return "Test: /ls sim (who is where) | /ls sim log [n] | /ls sim here (pirate + trader in front of you) | /ls sim wreck [clear] | /ls fly patrol | " +
+                    return "Test: /ls sim (who is where) | /ls sim log [n] | /ls sim here (pirate + trader in front of you) | /ls sim wreck [clear] | /ls sim tug (a salvage tug on the wrecks here) | /ls fly patrol | " +
                            "/ls sim reset | /ls reload | /ls spawn … | /ls clear. Probes and dumps: /ls help debug.";
                 case "debug":
                     return "/ls movepf <id> [x y z] <playfield> (legacy ChangePlayfield probe) | /ls gsinfo <id>... (global list: playfield, pos, faction) | " +
                            "/ls scan [radius] | /ls cargo <id> | /ls perf | /ls find [blockType=1314] [entityId|all] | /ls record [id] | " +
-                           "/ls makekiosk [id] | /ls purge | /ls kit | /ls npc | /ls traderblock | /ls holo [off] | /ls dialog | " +
+                           "/ls purge | /ls npc | /ls traderblock | /ls holo [off] | /ls dialog | " +
                            "old spike steering: /ls move …, /ls goto|follow …, /ls stop [a|b|c|d]";
                 default:
                     return Help;

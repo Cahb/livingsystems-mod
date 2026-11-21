@@ -1151,8 +1151,8 @@ public class SimBreakTests
         Assert.True(w.IsBroken(hub));
         Assert.Equal(0, hub.Cash);
         Assert.Equal(80000, hub.Stash.Single(s => s.Item == World.Strongbox).Amt);
-        var box = Assert.Single(w.Wrecks.Values, x => x.Hub == "h1");   // the guaranteed box
-        Assert.Equal("Den hoard", box.Name);
+        var box = Assert.Single(w.Wrecks.Values, x => x.Hub == "h1");   // the guaranteed box: the strongbox sack
+        Assert.True(box.Chest);
         Assert.InRange(hub.BrokenUntil - 100, 21 * 3600 * 0.75, 21 * 3600 * 1.25);
         Assert.Null(w.HubOf(roamer));   // no home to go back to while it's quiet
         Assert.True(roamer.Alive);
@@ -1310,5 +1310,70 @@ public class SimFledTests
         Assert.NotEqual("A", t.Dest);
         Assert.Equal(100, t.CargoAmt);
         Assert.False(t.IsLive);
+    }
+}
+
+public class SimTierSlackTests
+{
+    [Fact]
+    public void A_hub_drops_a_wealth_step_only_past_the_slack()
+    {
+        var w = new World();
+        var hub = new SimHub { Id = "h1", System = "C", Name = "Den", Cash = 210000 };
+        w.Hubs["h1"] = hub;
+        w.UpdateTier(hub);
+        Assert.Equal(2, w.HubTier(hub));
+        hub.Cash = 190000; w.UpdateTier(hub);   // just under the line: stays an outpost
+        Assert.Equal(2, w.HubTier(hub));
+        hub.Cash = 179000; w.UpdateTier(hub);   // a fifth of a step under: drops
+        Assert.Equal(1, w.HubTier(hub));
+        hub.Cash = 5000; w.UpdateTier(hub);
+        Assert.Equal(0, w.HubTier(hub));
+        hub.Cash = 95000; w.UpdateTier(hub);
+        Assert.Equal(0, w.HubTier(hub));
+        hub.Cash = 100000; w.UpdateTier(hub);
+        Assert.Equal(1, World.Parse(w.Serialize(), out _).Hubs["h1"].Tier);
+    }
+}
+
+public class GhostPingTests
+{
+    static SimWreck Wreck(string id, bool debris = false) => new SimWreck { Id = id, System = "C", Name = "Smoke Gull " + id, Hub = "h1", Debris = debris };
+
+    [Fact]
+    public void A_camp_is_silent_and_a_fat_hub_leaks()
+    {
+        var w = new World(); w.Config.GhostPerLoud = 0.01; w.Config.GhostMax = 0.06;
+        var hub = new SimHub { Id = "h1", System = "C", Name = "Den" };
+        w.Hubs["h1"] = hub;
+        w.Wrecks["c"] = new SimWreck { Id = "c", System = "C", Name = "Den", Hub = "h1", Centre = true };
+        Assert.Equal(0, w.GhostChance(w.Wrecks["c"]));            // the listening post never pings, nor counts
+        var first = Wreck("w1"); w.Wrecks["w1"] = first;
+        Assert.Equal(0, w.GhostChance(first));                  // one wreck, no cash: silent
+        w.Wrecks["w2"] = Wreck("w2"); w.Wrecks["d1"] = Wreck("d1", debris: true);
+        Assert.Equal(0.01, w.GhostChance(first), 6);            // debris doesn't count, and never pings itself
+        Assert.Equal(0, w.GhostChance(w.Wrecks["d1"]));
+        hub.Cash = 250000; w.UpdateTier(hub);                    // richer = louder
+        Assert.Equal(0.03, w.GhostChance(first), 6);
+        for (var i = 3; i < 10; i++) w.Wrecks["w" + i] = Wreck("w" + i);
+        Assert.Equal(w.Config.GhostMax, w.GhostChance(first), 6);
+        w.Config.GhostPings = false;
+        Assert.Equal(0, w.GhostChance(first));
+    }
+
+    [Fact]
+    public void A_ping_is_the_same_for_everyone_and_lands_near_the_wreck()
+    {
+        int hits = 0;
+        for (var m = 0; m < 10000; m++)
+        {
+            var t = 1_800_000_000 + m * 60.0;
+            var on = World.GhostPing("w1", 0.05, t, out var x, out var y, out var z);
+            Assert.Equal(on, World.GhostPing("w1", 0.05, t + 30, out var x2, out _, out _));   // same minute, same answer
+            if (!on) continue;
+            hits++; Assert.Equal(x, x2);
+            Assert.True(Math.Abs(x) <= 400 && Math.Abs(y) <= 400 && Math.Abs(z) <= 400);
+        }
+        Assert.InRange(hits, 400, 600);   // ~5 % of minutes
     }
 }

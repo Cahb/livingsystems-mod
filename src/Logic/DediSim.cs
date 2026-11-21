@@ -20,7 +20,7 @@ namespace LivingSystems
     /// Positions: PfServers report their stations (anchors); each trader runs a lane from its station (World.Track). The
     /// PfServer gets the lanes ("traffic"), and asks for a trader ("simwant") once a player is near its lane position.
     /// </summary>
-    sealed class DediSim
+    sealed partial class DediSim
     {
         readonly IModApi api;
         readonly Action<string> log;
@@ -38,6 +38,19 @@ namespace LivingSystems
         double startedAt;
         /// <summary>Old entities of agents that are no longer live, already destroyed by this instance.</summary>
         readonly HashSet<int> staleDone = new HashSet<int>();
+        /// <summary>Old hulls destroyed while their playfield may have been unloaded (a destroy there does nothing, the hull
+        /// comes back with the playfield): destroyed again the next time that playfield reports in.</summary>
+        readonly Dictionary<string, List<int>> ghostsLeft = new Dictionary<string, List<int>>();
+
+        /// <summary>An old hull of ours goes: now, and again when <paramref name="pf"/> next comes back.</summary>
+        void DestroyLeft(int id, string pf)
+        {
+            if (id <= 0 || !staleDone.Add(id)) return;
+            dedi.Destroy(id);
+            if (string.IsNullOrEmpty(pf)) return;
+            if (!ghostsLeft.TryGetValue(pf, out var l)) ghostsLeft[pf] = l = new List<int>();
+            if (!l.Contains(id)) l.Add(id);
+        }
         readonly Dictionary<string, double> wreckSpawning = new Dictionary<string, double>();
         /// <summary>Live agents asked for but not spawned yet (agent → when asked); given up after a while.</summary>
         readonly Dictionary<string, double> asked = new Dictionary<string, double>();
@@ -46,6 +59,8 @@ namespace LivingSystems
         public DediSim(IModApi api, Action<string> log, DediSpike dedi)
         {
             this.api = api; this.log = log; this.dedi = dedi;
+            World.TugShip = TugHull.Name;
+            log($"sim: salvage tugs fly {World.TugShip}{(World.TugShip == World.TugOverride ? " (the server's own prefabs/LS_Tug.epb)" : " (vanilla; drop your own prefabs/LS_Tug.epb to change it)")}");
             path = Path.Combine(api.Application.GetPathFor(AppFolder.SaveGame), "Mods", "LivingSystems", "sim.txt");
             world = Load(path, out var skipped);
             // a fresh save starts EMPTY: the network grows from stations as players discover them (JoinNetwork + Populate) —
@@ -54,6 +69,8 @@ namespace LivingSystems
             // live agents stay live across a logic reload / restart: their PfServer re-adopts them on simhello, and
             // Materialize sends them back to the sim if their playfield stays empty (after a grace period)
             startedAt = now;
+            world.Config.TugFleet = true;   // tugs live at their yards; hires take a real one
+            LoadPrices();
             world.Resume(now);
             if (world.Agents.Count == 0 && world.Config.Systems.Count > 0) { world.Seed(rng, now, 5, 2); world.LastTick = now; log("sim: new world seeded"); }
             if (world.Config.Systems.Count == 0) log("sim: fresh world — no trade network yet; it grows as players find stations");
@@ -63,6 +80,9 @@ namespace LivingSystems
             foreach (var a in world.Agents.Values.Where(x => x.IsLive && x.EntityId == 0).ToList()) world.EndLive(a.Id, "reset", Now);
             Save();
             log($"sim: {world.Agents.Count} agent(s) in {world.Config.Systems.Count} system(s){(skipped > 0 ? $", {skipped} bad line(s) skipped" : "")}");
+            // hires survive a reload: the menu gets them back (a call-in still on its way is called again)
+            foreach (var a in world.Agents.Values.Where(x => x.IsTug && x.State == "hired").ToList())
+                dedi.RestoreHire(World.HirePid(a), a.Name, World.HireEntity(a), World.HireFee(a), a.System, a.Extra.TryGetValue("tughome", out var th) ? th : "", World.HireOff(a));
             dedi.OnGlobalList = OnGlobalList;
             nextGlobal = 0;   // first tick asks for the structure list
             LoadGalaxy();
@@ -197,6 +217,9 @@ namespace LivingSystems
         /// reports, which only see bases near a player, are merged sticky instead).
         /// Playfields never generated have no structures yet — they get theirs when someone first goes there.
         /// </summary>
+        /// <summary>Factions whose bases are trading stations (Talon, Polaris, UCH, Civilian, Trader, Colonists).</summary>
+        static readonly HashSet<int> TradingFactions = new HashSet<int> { 6, 7, 11, 15, 18, 19 };
+
         void OnGlobalList(GlobalStructureList gl)
         {
             if (gl?.globalStructures == null) return;
@@ -204,7 +227,11 @@ namespace LivingSystems
             foreach (var kv in gl.globalStructures)
             {
                 var found = kv.Value.Where(g => g.type == 2 && !Factions.Hostile.Contains(g.factionGroup) && g.factionGroup != 0 && g.factionGroup != 1
-                                               && g.factionGroup != HailDisplay.WreckFaction && HailDisplay.StationRule(g.name, g.cntBlocks))
+                                               && g.factionGroup != HailDisplay.WreckFaction
+                                               // a freshly generated playfield lists its bases with 0 blocks (not counted yet): a trading faction's
+                                               // base then passes on its name — else a new system dropped its own shipyard, and every ship
+                                               // docked there or bound for it vanished at once (Beta V Sector)
+                                               && HailDisplay.StationRule(g.name, g.cntBlocks <= 0 && TradingFactions.Contains(g.factionGroup) ? 300 : g.cntBlocks))
                                     .Select(g => new SimStation { Id = g.id, Name = g.name ?? "", Pos = new Core.Flight.Vec3(g.pos.x, g.pos.y, g.pos.z) }).ToList();
                 // authoritative for a generated playfield (it lists every structure): replaces what we had — drops a base
                 // that's gone or no longer passes the rule (a crashed hulk listed once as a base)
@@ -298,6 +325,9 @@ namespace LivingSystems
             Save();
             Dispatch(news, pfs);
             TellBounties();
+            PayOwed();
+            FollowHires();
+            HireClocks();
             foreach (var pf in pfs)
                 api.Network.SendToPlayfieldServer(LivingSystemsMod.Channel, pf, Wire.Pack(0, "fly", "risk", world.RiskIn(pf, now).ToString()));
             Materialize(pfs, now);
@@ -320,7 +350,7 @@ namespace LivingSystems
             string N(double v) => v.ToString("0.#", inv);
             string Clean(string v) => (v ?? "").Replace(";", ",").Replace("|", "/");
             var entries = new List<object> { "traffic" };
-            foreach (var a in world.Agents.Values.Where(x => x.Alive && x.System == pf).OrderBy(x => x.Id, StringComparer.Ordinal))
+            foreach (var a in world.Agents.Values.Where(x => x.Alive && x.System == pf && !(x.IsTug && (x.State == "salvage" || (x.State == "fight" && x.After == "salvage")))).OrderBy(x => x.Id, StringComparer.Ordinal))   // tugs at the job: below
             {
                 if (!world.Track(a, out var tr)) continue;
                 var leg = a.State;
@@ -333,7 +363,27 @@ namespace LivingSystems
                 var b = a.State == "fight" ? tr.Dest : tr.B;   // a fight: A = where it is, B = where its leg goes on to
                 entries.Add(string.Join(";", a.Id, Clean(a.Name), leg, N(tr.A.X), N(tr.A.Y), N(tr.A.Z), N(b.X), N(b.Y), N(b.Z),
                                         N(tr.T0), N(tr.T1), a.IsLive ? "1" : "0", Clean(other), Clean(stationName), a.Kind, a.Hull.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture),
-                                        a.IsTrader ? World.RoleOf(a).Label : "pirate", a.IsTrader ? a.Cargo : a.Loot, a.IsTrader ? a.CargoAmt : a.LootMainAmt));
+                                        a.IsTug ? "salvage tug" : a.IsTrader ? World.RoleOf(a).Label : "pirate", a.IsTrader ? a.Cargo : a.Loot, a.IsTrader ? a.CargoAmt : a.LootMainAmt));
+            }
+            // salvage tugs at work: sitting at their target (field 12 = its wreck id, field 20 = the share cut so far); the
+            // PfServer makes one live only beside its target's spawned hull. Their other legs stay offline for now.
+            foreach (var a in world.Agents.Values.Where(x => x.IsTug && x.Alive && x.System == pf && (x.State == "salvage" || (x.State == "fight" && x.After == "salvage"))).OrderBy(x => x.Id, StringComparer.Ordinal))
+            {
+                var job = world.TugJobAny(a);
+                if (job == null) continue;
+                var tf = a.State == "fight" ? world.FightOf(a) : null;
+                if (tf != null && tf.HasPos)
+                {   // jumped at the job: the fight's place (it spawns there as a tug, pirates on it)
+                    entries.Add(string.Join(";", a.Id, Clean(a.Name), "fight", N(tf.Pos.X), N(tf.Pos.Y), N(tf.Pos.Z), N(tf.Pos.X), N(tf.Pos.Y), N(tf.Pos.Z),
+                                            N(Now), N(tf.Next), a.IsLive ? "1" : "0", Clean(job.Id), Clean(Where(pf, a.Extra.TryGetValue("tughome", out var fy) ? fy : pf)), a.Kind, a.Hull.ToString("0.##", inv),
+                                            "salvage tug", a.Cargo, a.CargoAmt, "0", world.TugShare(a, Now).ToString("0.###", inv)));
+                    continue;
+                }
+                if (a.State != "salvage") continue;
+                entries.Add(string.Join(";", a.Id, Clean(a.Name), "salvage", N(job.Pos.X), N(job.Pos.Y), N(job.Pos.Z), N(job.Pos.X), N(job.Pos.Y), N(job.Pos.Z),
+                                        N(Math.Max(Now, World.WorkStart(a))), N(a.Until), a.IsLive ? "1" : "0", Clean(job.Id), Clean(Where(pf, a.Extra.TryGetValue("tughome", out var yard) ? yard : pf)), a.Kind, a.Hull.ToString("0.##", inv),
+                                        "salvage tug", a.Cargo, a.CargoAmt, "0", world.TugShare(a, Now).ToString("0.###", inv),
+                                        a.Extra.TryGetValue(World.HoldKey, out var hold) ? hold : ""));   // field 21: its real hold (refills it if it goes live again)
             }
             // traders in warp toward here: on the band before they arrive — where they'll drop out, and when (chase them
             // through the jump: wait at their warp point)
@@ -342,14 +392,16 @@ namespace LivingSystems
                 if (!world.Arrival(a, out var wp, out var st)) continue;
                 entries.Add(string.Join(";", a.Id, Clean(a.Name), "arriving", N(wp.X), N(wp.Y), N(wp.Z), N(wp.X), N(wp.Y), N(wp.Z),
                                         N(a.Until), N(a.Until), "0", Clean(Where(pf, a.System)), Clean(st.Name), a.Kind, a.Hull.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture),
-                                        World.RoleOf(a).Label, a.Cargo, a.CargoAmt));
+                                        a.IsTug ? "salvage tug" : World.RoleOf(a).Label, a.Cargo, a.CargoAmt));
             }
             // wrecks: distress beacons (and the ones already spawned); hub wrecks ("hubwreck" / "debris") have no beacon —
             // station field "swap:<entity>" = take that hull down while nobody's near (it respawns as what it should be)
-            foreach (var w in world.Wrecks.Values.Where(x => x.System == pf))
+            // field 19: a lootable hub wreck's ghost-ping chance per minute (the PfServer rolls it)
+            foreach (var w in world.Wrecks.Values.Where(x => x.System == pf && !(x.Entity == 0 && x.NotBefore > Now)))
                 entries.Add(string.Join(";", w.Id, Clean(w.Name), !w.IsHub ? "wreck" : w.Debris || w.Gone ? "debris" : "hubwreck", N(w.Pos.X), N(w.Pos.Y), N(w.Pos.Z), N(w.Pos.X), N(w.Pos.Y), N(w.Pos.Z),
-                                        N(w.Time), N(Math.Min(w.Until, 1e12)), w.Entity != 0 ? "1" : "0", "", w.NeedsSwap ? "swap:" + w.Entity.ToString(inv) : "", "wreck", "0",
-                                        w.Kind == "pirate" ? "pirate" : Core.Sim.World.Roles.FirstOrDefault(r => r.Id == w.Role)?.Label ?? "freighter", w.Cargo, w.Amt));
+                                        N(w.Time), N(Math.Min(w.Until, 1e12)), w.Entity != 0 ? "1" : "0", "", w.NeedsSwap ? (w.Decor && w.Gone ? "swapnow:" : "swap:") + w.Entity.ToString(inv) : "", "wreck", "0",
+                                        w.Kind == "pirate" ? "pirate" : Core.Sim.World.Roles.FirstOrDefault(r => r.Id == w.Role)?.Label ?? "freighter", w.Cargo, w.Amt,
+                                        world.GhostChance(w).ToString("0.####", inv)));
             Send(pf, entries.ToArray());
         }
 
@@ -404,6 +456,8 @@ namespace LivingSystems
                 // goes to the LCD feed (fights only, above), not as a wall of MAYDAYs and broadcasts
                 if (fresh && here && a != null && a.IsTrader && (e.Kind == "pass" || e.Kind == "arrive")) Broadcast(e.System, a);
                 if (fresh && fight && e.Kind != "pirate-join" && (here || TestChat)) SayAll(e.Kind == "attack" ? "MAYDAY — " + e.Text : e.Text);
+                // a hub broken in front of you: what's up for grabs, and the salvage tug that's coming for the rest
+                if (fresh && here && (e.Kind == "broken" || e.Kind == "tugcall")) SayIn(e.System, e.Text);
             }
         }
 
@@ -421,7 +475,9 @@ namespace LivingSystems
             foreach (var a in world.Agents.Values.Where(x => !x.IsTrader && x.IsLive && x.Alive && x.State == "warp").ToList())
             {
                 if (!departing.Add(a.Id)) continue;
-                Send(a.Live, "simdepart", a.Id, Where(a.System, a.Dest));
+                // the spool message names the jump vector: home (a lead to the hub) or a hunting ground (a raid warning)
+                var home = world.HubOf(a) is Core.Sim.SimHub hub && hub.System == a.Dest;
+                Send(a.Live, "simdepart", a.Id, Where(a.System, a.Dest) + (home ? " — heading home, by the course" : " — out hunting"));
                 log($"sim: {a.Id} '{a.Name}' leaves '{a.Live}' live, bound for {a.Dest}");
             }
             departing.RemoveWhere(id => !(world.Get(id) is Core.Sim.SimAgent x) || !x.IsLive);
@@ -433,12 +489,21 @@ namespace LivingSystems
             foreach (var hub in world.Hubs.Values.Where(h => h.Stash.Count > 0 && pfs.Contains(h.System)))
             {
                 if (stashSent.TryGetValue(hub.Id, out var at) && now - at < 30) continue;
-                var box = world.Wrecks.Values.Where(x => x.Hub == hub.Id && !x.Debris && !x.Gone && x.Entity > 0 && x.Shown == "wreck").Where(x => !x.Centre).OrderByDescending(x => x.Time).FirstOrDefault();   // the hauled wrecks: the listening post has no crates
-                if (box == null) continue;
-                stashSent[hub.Id] = now;
-                var msg = new List<object> { "stash", box.Entity, hub.Id };
-                foreach (var s in hub.Stash.GroupBy(x => x.Item)) { msg.Add(s.Key); msg.Add(s.Sum(x => x.Amt)); }
-                Send(hub.System, msg.ToArray());
+                var box = world.Wrecks.Values.Where(x => x.Hub == hub.Id && !x.Debris && !x.Gone && x.Entity > 0 && x.Shown == "wreck").Where(x => !x.Centre && !x.Chest).OrderByDescending(x => x.Time).FirstOrDefault();   // the hauled wrecks: the listening post has no crates
+                // the payout goes into the strongbox sack by the listening post (the loot into the newest hauled wreck)
+                // (a strongbox not spawned yet keeps the payout waiting for it)
+                var chestRec = world.Wrecks.Values.FirstOrDefault(x => x.Hub == hub.Id && x.Chest && !x.Gone);
+                var chest = chestRec != null && chestRec.Entity > 0 ? chestRec : null;
+                var sent = false;
+                foreach (var to in new[] { chest, box }.Where(x => x != null).Distinct())
+                {
+                    var items = hub.Stash.Where(x => to == chest ? x.Item == Core.Sim.World.Strongbox : chestRec == null || x.Item != Core.Sim.World.Strongbox).GroupBy(x => x.Item).ToList();
+                    if (items.Count == 0) continue;
+                    var msg = new List<object> { "stash", to.Entity, hub.Id };
+                    foreach (var s in items) { msg.Add(s.Key); msg.Add(s.Sum(x => x.Amt)); }
+                    Send(hub.System, msg.ToArray()); sent = true;
+                }
+                if (sent) stashSent[hub.Id] = now;
             }
         }
 
@@ -452,6 +517,10 @@ namespace LivingSystems
                 if (now - since > 120) { w.Entity = 0; wreckSpawning.Remove(w.Id); changed = true; log($"sim: wreck {w.Id} '{w.Name}' spawn lost — beacon again"); }
             }
             foreach (var id in wreckSpawning.Keys.Where(k => !world.Wrecks.TryGetValue(k, out var x) || x.Entity >= 0).ToList()) wreckSpawning.Remove(id);
+            // a gang just broken with its post standing in front of a player: its core comes out now (loot / claimable);
+            // nobody there → the swap respawns it stripped
+            foreach (var w in world.Wrecks.Values.Where(x => x.Centre && !x.Post && x.Entity > 0 && x.Shown == "post" && pfs.Contains(x.System)))
+            { Send(w.System, "stripcore", w.Entity); w.Shown = "wreck"; changed = true; log($"sim: {w.Name}'s listening post {w.Entity}: gang broken, core out"); }
             foreach (var a in world.Agents.Values.ToList())
             {
                 if (a.IsLive && ((!pfs.Contains(a.Live) && now - startedAt > 45) || (a.EntityId == 0 && asked.TryGetValue(a.Id, out var t0) && now - t0 > 120)))
@@ -488,11 +557,12 @@ namespace LivingSystems
                 }
                 foreach (var m in members.Where(m => m.IsLive && m.EntityId == 0 && !asked.ContainsKey(m.Id)))
                 {
-                    if (m.IsTrader) { asked[m.Id] = now; changed = true; Send(f.Live, "trader", m.Id, m.Name, world.ShipOf(m), m.After == "out" ? Where(m.System, m.Dest) : "", MemoryLine(m), m.Cargo, m.CargoAmt, F(m.Speed)); }
+                    if (m.IsTug && m.After == "salvage") { asked[m.Id] = now; changed = true; Send(f.Live, "tug", m.Id, m.Name, world.ShipOf(m)); }   // jumped at the job: it sits there and takes it
+                    else if (m.IsTrader) { asked[m.Id] = now; changed = true; Send(f.Live, "trader", m.Id, m.Name, world.ShipOf(m), m.After == "out" ? Where(m.System, m.Dest) : "", MemoryLine(m), m.Cargo, m.CargoAmt, F(m.Speed), World.FormatHold(world.InventoryOf(m))); }
                     else if (target != null)
                     {
                         asked[m.Id] = now; changed = true;
-                        Send(f.Live, "pirate", m.Id, m.Name, PiratePrefab(m), target.EntityId, F(f.Pos.X), F(f.Pos.Y), F(f.Pos.Z), m.Loot, m.LootMainAmt, MemoryLine(m));
+                        Send(f.Live, "pirate", m.Id, m.Name, PiratePrefab(m), target.EntityId, F(f.Pos.X), F(f.Pos.Y), F(f.Pos.Z), m.Loot, m.LootMainAmt, MemoryLine(m), World.FormatHold(world.InventoryOf(m)));
                         log($"sim: pirate {m.Id} '{m.Name}' goes live in {f.Id} on {target.Name}");
                     }
                 }
@@ -514,21 +584,21 @@ namespace LivingSystems
         public bool TryHandle(string[] f, string playfield)
         {
             if (f.Length < 2) return false;
+            if (TryBody(f, playfield)) return true;
             var inv = System.Globalization.CultureInfo.InvariantCulture;
             switch (f[0])
             {
-                case "simspawn":
+                case "spill":   // spill|<name>|x|y|z|<hold>: one loot sack of what didn't fit a hull's crates
                 {
-                    var a = world.Get(f[1]);
-                    if (a == null || !a.IsLive || f.Length < 9) return true;
-                    float G(string v) => float.Parse(v, inv);
-                    var pf = a.Live;
-                    dedi.Spawn(pf, f[2], new PVector3(G(f[3]), G(f[4]), G(f[5])), new PVector3(0, G(f[6]), 0), f[7], byte.Parse(f[8], inv), id =>
-                    {
-                        a.EntityId = id; asked.Remove(a.Id); Save();
-                        Send(pf, "spawned", a.Id, id);
-                        log($"sim: {a.Id} '{a.Name}' spawned as {id} in '{pf}'");
-                    });
+                    if (f.Length < 6) return true;
+                    float C(string v) => float.TryParse(v, System.Globalization.NumberStyles.Float, inv, out var x) ? x : 0f;
+                    var hold = new Dictionary<string, int>(StringComparer.Ordinal);
+                    foreach (var kv in World.ParseHold(f[5])) if (kv.Value > 0) hold[kv.Key] = (hold.TryGetValue(kv.Key, out var had) ? had : 0) + kv.Value;
+                    var sack = world.AddSpill(playfield, new Core.Flight.Vec3(C(f[2]), C(f[3]), C(f[4])), f[1], hold, Now);
+                    if (sack == null) return true;
+                    Save();
+                    log($"sim: spill {sack.Id} '{sack.Name}' in '{playfield}': {hold.Values.Sum()} item(s) in {hold.Count} line(s)");
+                    SendTraffic(playfield);
                     return true;
                 }
                 case "simstations":   // a PfServer's real stations: the anchors for that system's lanes
@@ -580,16 +650,6 @@ namespace LivingSystems
                     if (JoinNetwork(pf)) Save();
                     return true;
                 }
-                case "wreckgone":   // a spawned wreck: cleaned up (nobody came) or claimed (a player's core) — the record goes
-                {                   // a hub wreck's hull swapped / vanished: it respawns as what it should be (or goes, over the cap)
-                    var ent = int.TryParse(f[1], out var e1) ? e1 : 0;
-                    var why = f.Length > 2 ? f[2] : "?";
-                    var w = world.Wrecks.Values.FirstOrDefault(x => x.Entity == ent);
-                    // "destroyed" = gone with a player right there (blown up / scrapped): gone for good, like a claim
-                    if (w != null && w.IsHub && why != "claimed" && why != "destroyed") { world.HubHullDown(w, lost: why == "vanished"); var hubOf = world.Hubs.TryGetValue(w.Hub, out var hh0) ? hh0 : null; if (hubOf != null) world.HubCaps(hubOf, Now); Save(); log($"sim: hub wreck {w.Id} '{w.Name}' hull {ent} down ({why}) — {(world.Wrecks.ContainsKey(w.Id) ? "respawns as " + (w.Debris ? "debris" : "wreck") : "gone")}"); SendTraffic(playfield); }
-                    else if (w != null) { world.Wrecks.Remove(w.Id); world.Count("eco|burn|wrecks gone live (looted or cleared)", w.Cash); Save(); log($"sim: wreck {w.Id} '{w.Name}' gone ({why})"); }
-                    return true;
-                }
                 case "stashed":   // hub loot made it into a hub wreck's boxes: "stashed|hub|entity|item|amt|item|amt…"
                 {
                     if (f.Length < 3 || !world.Hubs.TryGetValue(f[1], out var hub)) return true;
@@ -604,8 +664,34 @@ namespace LivingSystems
                     var a = world.Get(f[1]);
                     if (a == null || f.Length < 6) return true;
                     float G(string v) => float.Parse(v, inv);
-                    var w = world.Wreck(a, new Core.Flight.Vec3(G(f[3]), G(f[4]), G(f[5])), a.IsTrader ? a.Cargo : a.Loot, a.IsTrader ? a.CargoAmt : a.LootMainAmt, Now, rng);
-                    if (w != null) { w.Entity = int.Parse(f[2], inv); Save(); log($"sim: live wreck {w.Id} '{a.Name}' = entity {w.Entity}"); }
+                    // everything it carried goes on the record (a later tug gets it all); the hull keeps its own live cargo
+                    var w = world.Wreck(a, new Core.Flight.Vec3(G(f[3]), G(f[4]), G(f[5])), world.TakeShare(a, 1), Now, rng);
+                    if (w != null)
+                    {
+                        w.Entity = int.Parse(f[2], inv); Save(); log($"sim: live wreck {w.Id} '{a.Name}' = entity {w.Entity}");
+                        SendBody(playfield, WreckAdopt(w, false));   // its PfServer tracks the hull as this record (its pocket / purse into its crates)
+                    }
+                    return true;
+                }
+                case "simrob":   // "simrob|pirate|wreck": a live pirate killed its prey and strips the hull — its share off the record
+                {
+                    if (f.Length < 3) return true;
+                    var before = world.Events.Count;
+                    var got = world.RobWreck(f[1], f[2], Now, rng);
+                    foreach (var e in world.Events.Skip(before)) log("sim: " + e.Text);
+                    if (got.Count > 0 && world.Wrecks.TryGetValue(f[2], out var rw) && rw.Entity > 0)
+                        Send(playfield, "robbed", rw.Entity, World.FormatHold(got), BodyMsg.Clean(world.Get(f[1])?.Name ?? "the pirates"));
+                    Save();
+                    return true;
+                }
+                case "wreckcashed":   // "wreckcashed|wreck|put": the live hull's crates got its money (put < cash: no room)
+                {
+                    if (world.Wrecks.TryGetValue(f[1], out var w) && !w.CashAboard)
+                    {
+                        int.TryParse(f.Length >= 3 ? f[2] : "0", out var put);
+                        w.CashAboard = true; Save();
+                        log($"sim: wreck {w.Id} '{w.Name}': {put:N0} of {w.Cash:N0} cr into its crates");
+                    }
                     return true;
                 }
                 case "simdock":   // a live inbound trader reached its berth: docked, and stays parked there (live)
@@ -623,6 +709,18 @@ namespace LivingSystems
                     else dedi.Spawn(pf, f[1], new PVector3(G(f[2]), G(f[3]), G(f[4])), new PVector3(0, G(f[5]), 0), f.Length > 6 ? f[6] : "Wreck", 7, done);
                     return true;
                 }
+                case "hirehold":   // "hirehold|pid|entity|Item:N,…" → the trade window on it
+                    if (f.Length >= 4 && int.TryParse(f[1], out var hh) && int.TryParse(f[2], out var he)) dedi.OpenHiredHold(hh, he, f[3]);
+                    return true;
+                case "hiredone":   // "hiredone|pid|Item:N,…" → dismissed: the player's share of the haul
+                    if (f.Length >= 2 && int.TryParse(f[1], out var hd)) dedi.HireDone(hd, f.Length > 2 ? f[2] : "");
+                    return true;
+                case "hirestat":   // "hirestat|pid|text": the hired tug's status line for the menu
+                    if (f.Length >= 3 && int.TryParse(f[1], out var hsp)) dedi.HireStat(hsp, string.Join("|", f.Skip(2)));
+                    return true;
+                case "hirecash":   // "hirecash|pid|credits": money a hired tug found — the player's, in full
+                    if (f.Length >= 3 && int.TryParse(f[1], out var hcp) && int.TryParse(f[2], out var hcn)) dedi.HireCash(hcp, hcn);
+                    return true;
                 case "simmem":   // a live sim trader remembered something about a player: it's the agent's (persists across spawns)
                 {
                     var a = world.Get(f[1]);
@@ -644,15 +742,16 @@ namespace LivingSystems
                         // an Eden wrecked ship: whole hulk, or picked-over wreckage; past a hub's lootable few, stripped debris
                         var debris = wr.IsHub && wr.Debris;
                         var prefab = debris ? Core.Sim.World.DebrisPrefab(wr) : Core.Sim.World.WreckPrefab(wr);
-                        var mode = debris ? "debris" : wr.IsHub ? "hub" : "";
+                        var post = !debris && wr.Centre && wr.Post;   // an active gang's post: theirs, core in
+                        var mode = debris ? "debris" : post ? "post" : wr.Chest ? "chest" : wr.Spill ? "spill" : wr.IsHub ? "hub" : "";   // chest: the strongbox — the stash only; spill: its own lot only
                         wr.Entity = -1;   // spawning
-                        wr.Shown = debris ? "debris" : "wreck";
+                        wr.Shown = debris ? "debris" : post ? "post" : "wreck";
                         // adrift: pitched and rolled at a wrong angle, not parked level; NO faction (255): spawned as Polaris,
                         // looting a faction-owned hull costs that faction's rep (vanilla)
-                        dedi.Spawn(wpf, prefab, new PVector3(wr.Pos.X, wr.Pos.Y, wr.Pos.Z), new PVector3(rng.Next(-60, 61), rng.Next(360), rng.Next(-90, 91)), StructureTag.Apply(wr.Centre ? $"{wr.Name} ({(world.Hubs.TryGetValue(wr.Hub, out var ch) ? world.HubRank(ch) : "camp")})" : wr.Decor ? "Debris" : "Wreck of " + wr.Name), 255, id =>
+                        dedi.Spawn(wpf, prefab, new PVector3(wr.Pos.X, wr.Pos.Y, wr.Pos.Z), new PVector3(rng.Next(-60, 61), rng.Next(360), rng.Next(-90, 91)), StructureTag.Apply(wr.Centre ? $"{wr.Name} ({(world.Hubs.TryGetValue(wr.Hub, out var ch) ? world.HubRank(ch) : "camp")})" : wr.Decor ? "Debris" : wr.Chest ? "Pirate strongbox" : wr.Spill ? wr.Name : "Wreck of " + wr.Name), post ? SpikeCommand.FactionGroup("pirates") : (byte)255, id =>
                         {
                             wr.Entity = id; Save();
-                            Send(wpf, "wreckfill", id, wr.Id, debris ? "" : wr.Cargo, debris ? 0 : wr.Amt, Core.Sim.World.IsPrewrecked(prefab) || wr.IsHub ? "1" : "0", mode, debris ? 0 : wr.Cash);
+                            SendBody(wpf, WreckFill(wr, id, debris, Core.Sim.World.IsPrewrecked(prefab) || wr.IsHub || wr.Spill, mode));
                             log($"sim: wreck {wr.Id} '{wr.Name}' spawned as {id} in '{wpf}' — {prefab} ({(wr.Looted ? "picked over" : "whole")}, was {(wr.Ship.Length > 0 ? wr.Ship : "?")}; {wr.Amt} {wr.Cargo})");
                         });
                         return true;
@@ -660,6 +759,17 @@ namespace LivingSystems
                     var a = world.Get(f[1]);
                     var pf = playfield;
                     if (a == null || !a.Alive || a.IsLive || a.System != pf) return true;
+                    if (a.IsTug && a.State == "salvage")
+                    {   // a salvage tug at work: the PfServer asks only once its target's hull is there
+                        var job = world.TugJob(a);
+                        if (job == null || job.Entity <= 0) return true;
+                        if (a.EntityId > 0 && staleDone.Add(a.EntityId)) dedi.Destroy(a.EntityId);
+                        a.Live = pf; a.EntityId = 0; asked[a.Id] = Now;
+                        Send(pf, "tug", a.Id, a.Name, world.ShipOf(a));
+                        log($"sim: tug {a.Id} '{a.Name}' goes live in '{pf}' on {job.Id} '{job.Name}' ({world.TugShare(a, Now):P0} cut)");
+                        Save();
+                        return true;
+                    }
                     var fight = world.FightOf(a);
                     if (fight != null)
                     {   // a player came near a fight: the whole engagement goes live (spawned by Materialize)
@@ -676,7 +786,7 @@ namespace LivingSystems
                         if ((a.State != "lurk" && a.State != "home") || !world.Track(a, out var spot)) return true;
                         if (a.EntityId > 0 && staleDone.Add(a.EntityId)) dedi.Destroy(a.EntityId);
                         a.Live = pf; a.EntityId = 0; asked[a.Id] = Now;
-                        Send(pf, "pirate", a.Id, a.Name, PiratePrefab(a), 0, F(spot.A.X), F(spot.A.Y), F(spot.A.Z), a.Loot, a.LootMainAmt, MemoryLine(a));
+                        Send(pf, "pirate", a.Id, a.Name, PiratePrefab(a), 0, F(spot.A.X), F(spot.A.Y), F(spot.A.Z), a.Loot, a.LootMainAmt, MemoryLine(a), World.FormatHold(world.InventoryOf(a)));   // every loot line aboard (field 11)
                         log($"sim: lurking pirate {a.Id} '{a.Name}' goes live in '{pf}'");
                         Save();
                         return true;
@@ -684,27 +794,22 @@ namespace LivingSystems
                     if (!a.OnLeg && a.State != "dock" && a.State != "pass") return true;   // docked ones too: parked at their berth
                     if (a.EntityId > 0 && staleDone.Add(a.EntityId)) { dedi.Destroy(a.EntityId); log($"sim: old copy {a.EntityId} of {a.Id} destroyed before going live again"); }
                     a.Live = pf; a.EntityId = 0; asked[a.Id] = Now;
-                    Send(pf, "trader", a.Id, a.Name, world.ShipOf(a), a.State == "out" || a.State == "pass" ? Where(a.System, a.Dest) : "", MemoryLine(a), a.Cargo, a.CargoAmt, F(a.Speed));
+                    Send(pf, "trader", a.Id, a.Name, world.ShipOf(a), a.State == "out" || a.State == "pass" ? Where(a.System, a.Dest) : "", MemoryLine(a), a.Cargo, a.CargoAmt, F(a.Speed), World.FormatHold(world.InventoryOf(a)));   // everything aboard (field 9)
                     log($"sim: {a.Id} '{a.Name}' goes live in '{pf}' ({a.State} lane, {world.StationOf(a)?.Name})");
                     Save();
                     return true;
                 }
-                case "simend":
+                case "tugcut":   // a live tug finished a target ("tugcut|agent|wreck|1") or filled its hold part-way (share < 1)
                 {
                     var a = world.Get(f[1]);
-                    var how = f.Length > 2 ? f[2] : "left";
-                    if (a == null) return true;
-                    var frac = f.Length > 3 && double.TryParse(f[3], System.Globalization.NumberStyles.Float, inv, out var fr) ? fr : -1;
-                    var hull = f.Length > 4 && double.TryParse(f[4], System.Globalization.NumberStyles.Float, inv, out var hl) ? hl : -1;
+                    if (a == null || f.Length < 4) return true;
+                    var share = double.TryParse(f[3], System.Globalization.NumberStyles.Float, inv, out var sh) ? sh : 1;
                     var before = world.Events.Count;
-                    leftLive[a.Id] = Now;
-                    world.EndLive(a.Id, how, Now, frac, hull); asked.Remove(a.Id);
-                    var happened = world.Events.Skip(before).ToList();   // e.g. "Brass Goose was destroyed near SNUO" — announce it
-                    foreach (var e in happened) log("sim: " + e.Text);
-                    Dispatch(happened, PlayerPlayfields());
-                    log($"sim: {a.Id} '{a.Name}' back in the sim ({how}{(frac >= 0 ? $", {frac:P0} along its lane" : "")}{(hull >= 0 ? $", {hull:P0} of its blocks" : "")}{(a.Fight.Length > 0 ? $", still in {a.Fight}" : "")})");
-                    Save();
-                    if (a.System.Length > 0) SendTraffic(a.System);
+                    var more = world.TugCutLive(a.Id, f[2], share, Now);
+                    foreach (var e in world.Events.Skip(before)) log("sim: " + e.Text);
+                    log($"sim: tug {a.Id} '{a.Name}' cut {f[2]} live ({share:P0}) — {(more ? "next: " + world.TugJob(a)?.Id : "heading home")}");
+                    if (!more && a.IsLive) Send(a.Live, "tugleave", a.Id, Where(a.System, a.Extra.TryGetValue("tughome", out var th) ? th : ""));
+                    Save(); SendTraffic(a.System);
                     return true;
                 }
                 case "simhello":
@@ -714,25 +819,14 @@ namespace LivingSystems
                     var pf = f[1].Length > 0 ? f[1] : playfield;
                     nextGlobal = Math.Min(nextGlobal, Now + 20);   // a playfield just started (maybe generated just now): learn its stations
                     if (JoinNetwork(pf)) Save();
-                    foreach (var a in world.Agents.Values.Where(x => x.Live == pf).ToList())
-                    {
-                        if (a.EntityId == 0) { world.EndLive(a.Id, "reset", Now); asked.Remove(a.Id); continue; }
-                        var fight = world.FightOf(a);
-                        var target = a.IsTrader || fight == null ? 0 : world.MembersOf(fight).FirstOrDefault(t => t.IsTrader && t.IsLive && t.EntityId > 0)?.EntityId ?? 0;
-                        // a lurking / chilling pirate's spot goes along (else it flies off to the origin after a reload)
-                        var spt = default(Core.Sim.SimTrack);
-                        var spotOk = !a.IsTrader && (a.State == "lurk" || a.State == "home") && world.Track(a, out spt);
-                        if (spotOk) Send(pf, "adopt", a.Id, a.Kind, a.EntityId, target, F(spt.A.X), F(spt.A.Y), F(spt.A.Z), MemoryLine(a));
-                        else Send(pf, "adopt", a.Id, a.Kind, a.EntityId, target, "", "", "", MemoryLine(a));
-                        log($"sim: {a.Id} '{a.Name}' re-adopted by '{pf}' as {a.EntityId}");
-                    }
-                    // spawned wrecks in this playfield: its PfServer tracks them again (cleanup when nobody's near, claim, vanished)
-                    foreach (var w in world.Wrecks.Values.Where(x => x.System == pf && x.Entity > 0))
-                    { Send(pf, "wreckadopt", w.Entity, w.Id, w.IsHub ? (w.Debris ? "debris" : "hub") : ""); log($"sim: wreck {w.Id} '{w.Name}' re-adopted by '{pf}' as {w.Entity}"); }
+                    // a ship marked live here that never spawned: back to the sim (the rest are adopted as bodies below)
+                    foreach (var a in world.Agents.Values.Where(x => x.Live == pf && x.EntityId == 0).ToList()) { world.EndLive(a.Id, "reset", Now); asked.Remove(a.Id); }
+                    AdoptBodies(pf);   // live ships, hired tugs (every kind on bodies): the PfServer picks them up again
                     foreach (var a in world.Agents.Values.Where(x => !x.IsLive && x.EntityId > 0 && x.State != "dead" && !staleDone.Contains(x.EntityId)).ToList())
                     { staleDone.Add(a.EntityId); dedi.Destroy(a.EntityId); log($"sim: stale copy {a.EntityId} of {a.Id} '{a.Name}' destroyed"); }
                     Save();
                     SendTraffic(pf);
+                    Send(pf, "hellodone", pf);   // the PfServer asks until it sees this (an early hello's answers can be lost)
                     return true;
                 }
             }
@@ -743,6 +837,106 @@ namespace LivingSystems
         /// Hail → Talk: the <paramref name="n"/>-th thing this ship's crew has to say (rumours from the sim), or null if it's
         /// not a sim ship. Each "ask around" moves to the next one; wraps.
         /// </summary>
+        /// <summary>A station that can send a tug to a player: where, and how far (LY; 0 = this star system).</summary>
+        public sealed class TugOffer { public string Station = "", System = ""; public double Ly; public int Idle = 1; }
+
+        /// <summary>
+        /// Services → Call for a tug: stations with a yard (trading stations, shipyards, repair docks) within
+        /// <paramref name="rangeLy"/> of the player's playfield, nearest first, one per system.
+        /// </summary>
+        public List<TugOffer> TugOffers(string playfield, double rangeLy = 60)
+        {
+            var res = new List<TugOffer>();
+            foreach (var kv in world.Stations)
+            {
+                var yard = kv.Value.FirstOrDefault(x => Core.Sim.LiveRules.IsYard(x.Name));
+                if (yard == null) continue;
+                var ly = kv.Key == playfield ? 0 : world.Galaxy != null ? world.Galaxy.Distance(playfield, kv.Key) : double.PositiveInfinity;
+                if (double.IsNaN(ly) || ly > rangeLy) continue;
+                if (world.Config.TugFleet && !world.TugHomes().Contains(kv.Key)) continue;
+                res.Add(new TugOffer { Station = yard.Name, System = kv.Key, Ly = ly, Idle = world.Config.TugFleet ? world.IdleAt(kv.Key).Count : 1 });
+            }
+            return res.OrderBy(o => o.Ly).ThenBy(o => o.System, StringComparer.Ordinal).Take(5).ToList();
+        }
+
+        /// <summary>Salvaged parts priced by the scenario's ItemsConfig MarketPrice (our own table keeps its tuned goods).</summary>
+        void LoadPrices()
+        {
+            {
+                try
+                {
+                    var dir = Recipes.FindConfigDir(api.Application.GetPathFor(AppFolder.Content), api.Application.GetPathFor(AppFolder.SaveGame));
+                    if (!File.Exists(Path.Combine(dir, "ItemsConfig.ecf"))) { log($"sim: no ItemsConfig in {dir}"); return; }
+                    var r = Recipes.Parse(File.ReadAllText(Path.Combine(dir, "BlocksConfig.ecf")), "", File.ReadAllText(Path.Combine(dir, "ItemsConfig.ecf")));
+                    World.PriceFallback = r.Price;
+                    World.StackSizeOf = r.StackSize;
+                    log($"sim: item prices from {dir} ({r.ItemCount} items; Motor {r.Price("Motor"):0} cr, stacks of {r.StackSize("SteelPlate")} plates)");
+                    return;
+                }
+                catch (Exception ex) { log($"sim: reading item prices threw {ex.Message}"); }
+            }
+            log("sim: no ItemsConfig found — unknown items price at 1 cr");
+        }
+
+        /// <summary>A hire: the tug's name, and its hull when it was docked live right there (it flies over; nothing spawns).</summary>
+        public sealed class HireResult { public string Name = ""; public int Entity; }
+
+        /// <summary>A player hires a tug from <paramref name="home"/>'s yard; null if none is free there.</summary>
+        public HireResult HireTug(string home, int pid, string playfield, int fee)
+        {
+            if (!world.Config.TugFleet) return new HireResult();   // the old way: a tug made for the hire (the menu names it)
+            var a = world.HireTug(home, pid, playfield, fee, Now);
+            if (a == null) return null;
+            var hull = World.HireEntity(a);
+            Save(); log($"sim: {a.Id} '{a.Name}' hired by {pid} from {home} for '{playfield}' ({fee} cr){(hull > 0 ? $", its live hull {hull} undocks" : "")}");
+            if (hull > 0) Send(playfield, "hiretake", pid, a.Id, hull, a.Name.Replace(' ', '_'), home);
+            return new HireResult { Name = a.Name, Entity = hull };
+        }
+
+        /// <summary>What the sim owes players who are online now (a dismissed tug's share, once it sold): wired, with why.</summary>
+        void PayOwed()
+        {
+            if (world.Owed.Count == 0) return;
+            List<int> online; try { online = (api.Application.GetPlayerEntityIds() ?? new List<int>()).ToList(); } catch { return; }
+            foreach (var pid in world.Owed.Keys.Where(online.Contains).ToList())
+            {
+                var o = world.Owed[pid];
+                world.Owed.Remove(pid);
+                dedi.PayOwedTo(pid, o.Credits, o.Note);
+                log($"sim: paid {pid} {o.Credits} cr owed ({o.Note})");
+            }
+            Save();
+        }
+
+        /// <summary>A hire ends: "dismiss" (home to sell <paramref name="manifest"/>; the player's <paramref name="payShare"/>
+        /// is paid when it sells), "release" (never got there), "lost". False = no sim tug (the caller pays at once).</summary>
+        public bool HireEnd(int pid, string how, string manifest, double payShare)
+        {
+            var a = world.HiredBy(pid);
+            if (a == null) return false;
+            world.HireEnds(a, how, manifest, Now, payShare); Save();
+            if (how == "dismiss" && a.IsLive) Send(a.Live, "hiregone", a.Id, a.EntityId, a.Dest);   // the PfServer flies it out as a leaving ship
+            log($"sim: hire of {a.Id} '{a.Name}' by {pid} ends ({how})");
+            return how == "dismiss";
+        }
+
+        /// <summary>
+        /// Hail → Talk: what this crew knows, by topic, its own request first ("What we need"). Null = not a sim ship;
+        /// empty = nothing to tell (or a pirate, who doesn't chat).
+        /// </summary>
+        public List<KeyValuePair<string, List<string>>> TalkTopics(int entityId, int pid)
+        {
+            var a = world.ByEntity(entityId);
+            if (a == null) return null;
+            var res = new List<KeyValuePair<string, List<string>>>();
+            if (!a.IsTrader) return res;
+            if (world.WantOf(a) is World.Want w)
+                res.Add(new KeyValuePair<string, List<string>>("What we need", new List<string> { $"{w.Why} We'd pay {w.Price:N0} a piece for {World.Humanize(w.Item)} — up to {w.Left}." }));
+            foreach (var g in world.RumourTopics(a, PlayerKeys(pid), Now, Where).GroupBy(r => r.Topic))
+                res.Add(new KeyValuePair<string, List<string>>(g.Key, g.Select(r => r.Text).ToList()));
+            return res;
+        }
+
         public string Talk(int entityId, int pid, int n)
         {
             var a = world.ByEntity(entityId);
@@ -762,7 +956,7 @@ namespace LivingSystems
         public DediTrade.ShipDeal ShipDeal(int entityId, int pid)
         {
             var a = world.ByEntity(entityId);
-            if (a == null || !a.IsTrader || !a.Alive) return null;
+            if (a == null || !a.IsTrader || a.IsTug || !a.Alive) return null;   // a tug is kind "trader" in the sim but sells nothing
             var d = new DediTrade.ShipDeal { Ship = a.Name, BuysAt = item => World.BuyPrice(a, item), Cash = world.Cash(a) };
             if (world.WantOf(a) is World.Want want)
             {
@@ -904,7 +1098,7 @@ namespace LivingSystems
         public string TradeLine(int entityId)
         {
             var a = world.ByEntity(entityId);
-            if (a == null || !a.IsTrader || !a.Alive) return null;
+            if (a == null || !a.IsTrader || a.IsTug || !a.Alive) return null;   // a tug is kind "trader" in the sim but sells nothing
             var sells = new List<string>();
             if (a.CargoAmt > 0) sells.Add($"{World.Humanize(a.Cargo)} {a.CargoAmt}");
             sells.AddRange(world.Stores(a).Select(kv => $"{World.Humanize(kv.Key)} {kv.Value}"));
@@ -945,6 +1139,40 @@ namespace LivingSystems
                     Save(); Tick(true);
                     return;
                 }
+                case "tug":   // test: a salvage tug at work on the wrecks in the caller's system right now (goes live beside its target)
+                {
+                    var pf = api.Application.GetPlayerDataFor(pid)?.PlayfieldName ?? "";
+                    var tug = world.TugHere(pf, Now);
+                    if (tug == null) { say(pid, "sim: no wreck here a tug could take (try /ls sim wreck first)"); return; }
+                    Save(); SendTraffic(pf);
+                    say(pid, $"sim: {tug.Name} is at work on {world.TugJob(tug)?.Name} ({world.Wrecks.Values.Count(x => x.Tug == tug.Id)} on its list) — fly to the wreck: /ls fly where");
+                    return;
+                }
+                case "hireclock":   // test: wind your hire's share clock to <minutes> (a step test can't wait 2 h)
+                {
+                    var a = world.HiredBy(pid);
+                    if (a == null) { say(pid, "sim: no hire of yours"); return; }
+                    if (double.TryParse(cmd.Arg(1, ""), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var mins) && mins >= 0)
+                    { a.Extra["hireclock"] = (mins * 60).ToString("R", System.Globalization.CultureInfo.InvariantCulture); a.Extra.Remove("hirestep"); Save(); }
+                    var line = HireClockLine(pid);
+                    log($"sim: hireclock {a.Id} '{a.Name}' of {pid}: {World.HireClock(a) / 60:0.0} min, you'd get {world.HirePayout(a):P0} — {line}");
+                    say(pid, $"sim: {a.Name}: {World.HireClock(a) / 60:0} min on hire — you'd get {world.HirePayout(a):P0}; {line}");
+                    return;
+                }
+                case "spillclear":   // test / admin: every spill sack gone (records, hulls; the playfields forget them)
+                {
+                    var sacks = world.Wrecks.Values.Where(x => x.Spill).ToList();
+                    foreach (var w in sacks)
+                    {
+                        world.Wrecks.Remove(w.Id);
+                        SendBody(w.System, BodyMsg.Drop("wreck", w.Id));
+                        if (w.Entity > 0 && staleDone.Add(w.Entity)) dedi.Destroy(w.Entity);
+                    }
+                    Save();
+                    log($"sim: spillclear — {sacks.Count} spill sack(s) gone");
+                    say(pid, $"sim: {sacks.Count} spill sack(s) cleared");
+                    return;
+                }
                 case "wreck":   // test: a wreck beacon in the caller's system, ~3 km out on a station lane, with a random cargo
                 {
                     if (cmd.Arg(1, "") == "clear")
@@ -977,7 +1205,7 @@ namespace LivingSystems
                     world.Focus = focus; world.Config.WrecksPerSystem = cap;
                     if (w == null) { say(pid, "sim: couldn't place a wreck (cap?)"); return; }
                     Save(); SendTraffic(pf);
-                    say(pid, $"sim: wreck {w.Id} '{w.Name}' ({World.RoleOf(dummy).Label}, {w.Amt} {World.Humanize(w.Cargo)}) {where} — /ls fly where");
+                    say(pid, $"sim: wreck {w.Id} '{w.Name}' ({World.RoleOf(dummy).Label}, {w.Amt} {World.Humanize(w.Cargo)}) {where} at {w.Pos.X:0},{w.Pos.Y:0},{w.Pos.Z:0} — /ls fly where");
                     return;
                 }
                 case "reset":
@@ -1015,7 +1243,16 @@ namespace LivingSystems
             return heartbeat.Where(p => now - p.Value < 100).Select(p => p.Key).ToList();   // heartbeat every 15 s; a stall of a few isn't "empty"
         }
         readonly Dictionary<string, double> heartbeat = new Dictionary<string, double>();
-        public void Heartbeat(string playfield) { if (!string.IsNullOrEmpty(playfield)) heartbeat[playfield] = Now; }
+        public void Heartbeat(string playfield)
+        {
+            if (string.IsNullOrEmpty(playfield)) return;
+            var back = !heartbeat.TryGetValue(playfield, out var last) || Now - last > 60;
+            heartbeat[playfield] = Now;
+            if (!back || !ghostsLeft.TryGetValue(playfield, out var left)) return;
+            ghostsLeft.Remove(playfield);
+            foreach (var id in left) dedi.Destroy(id);
+            log($"sim: '{playfield}' back — {left.Count} hull(s) left behind there destroyed again ({string.Join(", ", left)})");
+        }
 
         /// <summary>A trader's hello on entering a system: to every player in that playfield, from the ship's name.</summary>
         void Broadcast(string pf, Core.Sim.SimAgent a)
@@ -1142,6 +1379,13 @@ namespace LivingSystems
             {
                 SenderType = Eleon.SenderType.ServerInfo, Channel = Eleon.MsgChannel.SinglePlayer, RecipientEntityId = pid, SenderNameOverride = from, Text = text,
             });
+
+        /// <summary>Chat to every player in one playfield.</summary>
+        void SayIn(string pf, string text)
+        {
+            foreach (var id in api.Application.GetPlayerEntityIds())
+                if (api.Application.GetPlayerDataFor(id)?.PlayfieldName == pf) SayTo(id, "LS", text);
+        }
 
         void SayAll(string text)
         {

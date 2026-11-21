@@ -131,6 +131,9 @@ namespace LivingSystems.Core.Flight
         /// Face <paramref name="dir"/> with up as close to <paramref name="up"/> as possible. Looking (nearly) along
         /// the up reference leaves roll undefined: keep the ship's own up then, so it doesn't spin.
         /// </summary>
+        /// <summary>Turn to look along <paramref name="dir"/>, keeping the ship's own up (an aimed hold: a salvage tug's beam).</summary>
+        public static Quat Facing(ShipState s, Vec3 dir) => Face(s, dir, s.Rot.Up);
+
         static Quat Face(ShipState s, Vec3 dir, Vec3 up)
         {
             if (dir.Length < 1e-3f) return s.Rot;

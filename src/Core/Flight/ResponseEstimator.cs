@@ -59,6 +59,16 @@ namespace LivingSystems.Core.Flight
         public const float FrozenAccel = 0.1f;
         float deadTime, aliveTime;
         bool everResponsive;
+        /// <summary>Thrust known up front (the hull's own stats): estimates stay fixed, only responsiveness is still watched.</summary>
+        public bool Pinned { get; private set; }
+
+        /// <summary>Fix full thrust per direction (m/s²) — e.g. read off the hull's Statistics panel; nothing is learned.</summary>
+        public void Pin(float forward, float back, float up, float down, float right, float left)
+        {
+            float[] v = { right, left, up, down, forward, back };
+            for (var i = 0; i < 6; i++) { full[i] = Math.Max(MinAccel, Math.Min(MaxAccel, v[i])); learned[i] = true; }
+            Pinned = true;
+        }
 
         public float FullAccel(int axis, bool negative) => full[axis * 2 + (negative ? 1 : 0)];
         public bool Learned(int axis, bool negative) => learned[axis * 2 + (negative ? 1 : 0)];
@@ -93,12 +103,13 @@ namespace LivingSystems.Core.Flight
                     //    is measured, or damage would never be noticed.
                     dirDead[i] += dt;
                     var weakButAlive = Math.Abs(Get(accel, axis)) >= FrozenAccel;
-                    if (weakButAlive && learned[i] && everResponsive && dirDead[i] >= DirectionLostAfter)
+                    if (!Pinned && weakButAlive && learned[i] && everResponsive && dirDead[i] >= DirectionLostAfter)
                         full[i] = Math.Max(MinAccel, full[i] + (Math.Max(0f, sample) - full[i]) * k);
                     continue;
                 }
                 dirDead[i] = 0;
                 alive = true;
+                if (Pinned) continue;
                 if (!learned[i])
                 {
                     // first real sample replaces the guess — but only from a solid throttle, and bounded

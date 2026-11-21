@@ -92,6 +92,9 @@ namespace LivingSystems.Core.Sim
         /// <summary>A yard keeps a ship this much longer per missing hull (×(1 − hull)) — a full rebuild takes a while.</summary>
         public const double YardSecondsPerHull = 900;
 
+        /// <summary>A station that builds ships (Eden2: Industrial Shipyard, New Hope Shipyard).</summary>
+        public static bool IsShipyard(string stationName) => (stationName ?? "").IndexOf("Shipyard", StringComparison.OrdinalIgnoreCase) >= 0;
+
         /// <summary>A station that fixes ships fully: trading stations, starports, shipyards, repair docks.</summary>
         public static bool IsYard(string stationName)
         {

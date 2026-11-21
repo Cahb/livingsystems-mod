@@ -346,3 +346,364 @@ public class HubDecorTests
         Assert.True(World.Parse(w.Serialize(), out _).Wrecks.Values.Any(x => x.Decor));
     }
 }
+
+public class StrongboxTests
+{
+    [Fact]
+    public void A_broken_hub_drops_its_junk_and_leaves_a_strongbox_by_the_antenna_until_it_reforms()
+    {
+        var w = new World(); w.Config.Systems = new List<string> { "A" };
+        var hub = new SimHub { Id = "h1", System = "C", Name = "Den", Size = 3, Manned = true, Cash = 30000, Pos = new LivingSystems.Core.Flight.Vec3(1000, 0, 0) };
+        w.Hubs["h1"] = hub;
+        var centre = w.EnsureCentre(hub, 0);
+        Assert.Single(w.Wrecks.Values, x => x.Decor);
+        var p = w.Add(new SimAgent { Id = "p1", Name = "Last Man", Kind = "pirate", System = "C", State = "home", Home = "h1", Until = 1e9, Live = "x" });
+        w.LastTick = 100;
+        w.EndLive(p.Id, "dead", 100);
+        Assert.True(w.IsBroken(hub));
+        Assert.DoesNotContain(w.Wrecks.Values, x => x.Decor);                       // junk gone at once
+        var chest = Assert.Single(w.Wrecks.Values, x => x.Chest);
+        Assert.InRange((chest.Pos - centre.Pos).Length, 39, 41);                    // right by the listening post
+        Assert.Equal(World.ChestPrefab, World.WreckPrefab(chest));
+        Assert.Equal(0, w.GhostChance(chest));
+        Assert.Contains(hub.Stash, s => s.Item == World.Strongbox);
+        Assert.True(World.Parse(w.Serialize(), out _).Wrecks[chest.Id].Chest);
+        w.EnsureCentre(hub, 200);
+        Assert.DoesNotContain(w.Wrecks.Values, x => x.Decor);                       // cleared junk stays cleared
+        w.Step(hub.BrokenUntil + 10, new Random(1));
+        Assert.DoesNotContain(w.Wrecks.Values, x => x.Chest);                       // re-formed: the old strongbox goes
+    }
+}
+
+public class TugTests
+{
+    static World Broken(out SimHub hub)
+    {
+        var w = new World(); w.Config.Systems = new List<string> { "Port" };
+        w.SetStations("Port", new List<SimStation> { new SimStation { Id = 1, Name = "Yard", Pos = new LivingSystems.Core.Flight.Vec3(0, 0, 0) } });
+        hub = new SimHub { Id = "h1", System = "Den", Name = "Den", Size = 3, Manned = true, Cash = 30000, Pos = new LivingSystems.Core.Flight.Vec3(1000, 0, 0) };
+        w.Hubs["h1"] = hub;
+        w.EnsureCentre(hub, 0);
+        for (var i = 0; i < 3; i++)
+            w.Wrecks["x" + i] = new SimWreck { Id = "x" + i, System = "Den", Name = "Hulk " + i, Kind = "trader", Hub = "h1", Time = i, Until = World.Never, Cargo = "GoldIngot", Amt = 10 };
+        var p = w.Add(new SimAgent { Id = "p1", Name = "Last Man", Kind = "pirate", System = "Den", State = "home", Home = "h1", Until = 1e9, Live = "x" });
+        w.LastTick = 100;
+        w.EndLive(p.Id, "dead", 100);
+        return w;
+    }
+
+    [Fact]
+    public void A_tug_clears_a_broken_hub_sells_the_scrap_and_retires()
+    {
+        var w = Broken(out var hub);
+        Assert.True(w.IsBroken(hub));
+        var tug = Assert.Single(w.Agents.Values, a => a.IsTug);                // sent the moment it broke
+        Assert.Equal(0, hub.SalvageAt);                                         // taken: not on the board
+        var call = Assert.Single(w.Events, e => e.Kind == "tugcall");
+        Assert.Contains(tug.Name, call.Text); Assert.Contains("Yard", call.Text); Assert.Contains("ETA ~", call.Text);
+        Assert.True(tug.Until - 100 <= 600);                                    // short dock: it's there while you are
+        var rng = new Random(1);
+        w.Step(800, rng);
+        Assert.Equal("Port", tug.Extra["tughome"]);
+        Assert.True(w.Wrecks.Values.Where(x => x.Hub == "h1" && !x.Chest).All(x => x.Tug == tug.Id));   // antenna + hulks claimed
+        Assert.True(w.Wrecks.Values.Single(x => x.Chest).Tug.Length == 0);                              // the strongbox is the players'
+        for (var t = 1300.0; t < 12 * 3600; t += 600) w.Step(t, rng);   // the server steps often
+        Assert.False(w.Agents.Values.Any(a => a.IsTug), string.Join(" | ", w.Agents.Values.Where(a => a.IsTug).Select(a => $"{a.State} {a.System} until {a.Until - hub.SalvageAt:0} cargo {a.CargoAmt}")) + " || " + string.Join(" | ", w.Events.Where(e => e.Agent == tug.Id || e.Kind == "tug").Select(e => e.Text)));   // done, home, retired
+        Assert.False(w.Wrecks.Values.Any(x => x.Hub == "h1" && !x.Chest), string.Join(" | ", w.Wrecks.Values.Where(x => x.Hub == "h1").Select(x => $"{x.Name} tug={x.Tug} gone={x.Gone} chest={x.Chest} ent={x.Entity}")) + " || " + string.Join(" | ", w.Events.Where(e => e.Agent == tug.Id || e.Kind == "tug").Select(e => e.Text)));   // the pile is gone
+        Assert.True(w.Stat("eco|tug|sold") > 0);
+        Assert.Equal(4, w.Stat("eco|tug|cut"));                                                         // 3 hulks + the antenna
+        Assert.Null(w.EnsureCentre(hub, w.LastTick));                                                    // no new post while broken
+    }
+
+    [Fact]
+    public void A_lost_tug_is_not_replaced_and_its_list_waits_for_the_next()
+    {
+        var w = Broken(out var hub);
+        var rng = new Random(2);
+        w.Step(hub.SalvageAt + 700, rng);
+        var tug = w.Agents.Values.Single(a => a.IsTug);
+        tug.State = "dead"; tug.Until = w.LastTick;                              // jumped and killed
+        w.Step(w.LastTick + 1, rng);
+        Assert.DoesNotContain(w.Agents.Values, a => a.Id == tug.Id);
+        Assert.True(w.Wrecks.Values.Where(x => x.Hub == "h1" && !x.Chest).All(x => x.Tug.Length == 0));
+        Assert.Equal(1, w.Stat("eco|tug|lost"));
+        Assert.True(hub.SalvageAt > 0);                                          // the pile is back on the board
+        var round = World.Parse(w.Serialize(), out var skipped);
+        Assert.Equal(0, skipped);
+        Assert.Equal(hub.SalvageAt, round.Hubs["h1"].SalvageAt, 3);
+    }
+}
+
+public class PostTests
+{
+    [Fact]
+    public void The_post_is_the_gangs_while_it_stands_and_a_broken_gang_reforms_elsewhere()
+    {
+        var w = new World { Galaxy = Galaxy.Parse(new[] { HubTests.Yaml }) };
+        w.Config.Systems = new List<string> { "Alpha Station", "Beta Station" };
+        w.SetStations("Alpha Station", new List<SimStation> { new SimStation { Id = 1, Name = "Lambda" } });
+        w.SetStations("Beta Station", new List<SimStation> { new SimStation { Id = 2, Name = "Kappa" } });
+        w.Config.StarsPerHub = 0.5;
+        var hub = w.DiscoverHubs(w.Galaxy.Stars.Values, 0).First();
+        foreach (var other in w.Hubs.Values.Where(h => h != hub).ToList()) w.Hubs.Remove(other.Id);
+        foreach (var x in w.Wrecks.Values.Where(x => x.Hub != hub.Id).ToList()) w.Wrecks.Remove(x.Id);
+        hub.Manned = true; hub.Cash = 20000;
+        var post = w.Wrecks.Values.Single(x => x.Centre && x.Hub == hub.Id);
+        Assert.True(post.Post);                                                // the gang's: spawns with its core in
+        post.Entity = 7; post.Shown = "post";
+        Assert.False(post.NeedsSwap);
+        w.Wrecks["hulk"] = new SimWreck { Id = "hulk", System = hub.System, Name = "Hulk", Kind = "trader", Hub = hub.Id, Time = 1, Until = World.Never };
+        var oldSys = hub.System; var oldStar = w.Galaxy.StarOf(oldSys).Name;
+        var p = w.Add(new SimAgent { Id = "p1", Name = "Last Man", Kind = "pirate", System = hub.System, State = "home", Home = hub.Id, Until = 1e9, Live = "x" });
+        w.LastTick = 100;
+        w.EndLive(p.Id, "dead", 100);                                          // the guards are dead: broken
+        Assert.True(w.IsBroken(hub));
+        Assert.False(post.Post);                                               // core comes out (PfServer strips it)
+        Assert.True(World.Parse(w.Serialize(), out _).Wrecks.Values.Any(x => x.Centre && !x.Post));
+        w.Step(hub.BrokenUntil + 1, new Random(1));                             // the quiet's over: re-forms
+        Assert.False(w.IsBroken(hub));
+        Assert.NotEqual(oldStar, w.Galaxy.StarOf(hub.System).Name);           // somewhere else
+        Assert.True(!w.Wrecks.TryGetValue("hulk", out var hk) || hk.Hub.Length == 0);   // left behind as an abandoned wreck (or a tug took it)
+        Assert.Contains(w.Wrecks.Values, x => x.Centre && x.Hub == hub.Id && x.System == hub.System && x.Post);   // a new post there, theirs
+        Assert.Contains(w.Events, e => e.Kind == "hubmoved" && e.System == oldSys);
+    }
+}
+
+public class TugLiveTests
+{
+    static (World w, SimAgent tug) AtWork(string hullA = "")
+    {
+        var w = new World(); w.Config.Systems = new List<string> { "Port" }; w.Config.TugSafeMin = 0;
+        w.SetStations("Port", new List<SimStation> { new SimStation { Id = 1, Name = "Yard", Pos = new LivingSystems.Core.Flight.Vec3(0, 0, 0) } });
+        w.Wrecks["a"] = new SimWreck { Id = "a", System = "Gulch", Name = "A", Kind = "trader", Time = 1, Until = World.Never, Salvage = true, Ship = hullA };
+        w.Wrecks["b"] = new SimWreck { Id = "b", System = "Gulch", Name = "B", Kind = "trader", Time = 2, Until = World.Never, Salvage = true };
+        var rng = new Random(1);
+        w.LastTick = 100; w.Step(800, rng);
+        var tug = w.Agents.Values.Single(x => x.IsTug);
+        for (var t = 900.0; tug.State != "salvage" && t < 20000; t += 60) w.Step(t, rng);
+        Assert.Equal("salvage", tug.State);
+        return (w, tug);
+    }
+
+    [Fact]
+    public void The_share_grows_offline_and_a_wreck_spawns_that_far_cut()
+    {
+        var (w, tug) = AtWork();
+        var job = w.TugJob(tug);
+        Assert.Equal("a", job.Id);                                            // oldest first
+        var start = tug.Until - w.Config.TugWork;
+        Assert.Equal(0.5, w.TugShare(tug, start + w.Config.TugWork / 2), 2);
+        Assert.Equal(0.5, w.CutShare(job, start + w.Config.TugWork / 2), 2);
+        Assert.Equal(0, w.CutShare(w.Wrecks["b"], start + w.Config.TugWork / 2)); // not its turn yet
+    }
+
+    [Fact]
+    public void A_tug_keeps_its_real_hold_until_it_sells()
+    {
+        Assert.Equal("GoldIngot:218,SteelPlate:368", World.FormatHold(World.ParseHold("SteelPlate:368,GoldIngot:200,GoldIngot:18,Bad,X:0")));
+        var (w, tug) = AtWork();
+        w.SetHold(tug, "SteelPlate:368,GoldIngot:218,OxygenBottleLarge:131,MoneyCard:7221");
+        var saved = World.Parse(w.Serialize(), out _);
+        Assert.Equal(w.Agents[tug.Id].Extra[World.HoldKey], saved.Agents[tug.Id].Extra[World.HoldKey]);   // survives the save
+        // it finishes, goes home, sells: the sale names the real goods, the hold is cleared
+        var rng = new Random(2);
+        for (var t = tug.Until + 1; t < tug.Until + 50000 && !w.Events.Any(e => e.Kind == "sold" && e.Agent == tug.Id); t += 60) w.Step(t, rng);
+        var sold = w.Events.Last(e => e.Kind == "sold" && e.Agent == tug.Id);
+        Assert.Contains("Money Card", sold.Text);
+        Assert.False(tug.Extra.ContainsKey(World.HoldKey));
+        // anyone else: not a tug, no hold
+        var trader = w.Add(new SimAgent { Id = "t9", Name = "X", Kind = "trader", System = "Port" });
+        w.SetHold(trader, "GoldIngot:1");
+        Assert.False(trader.Extra.ContainsKey(World.HoldKey));
+    }
+
+    [Fact]
+    public void A_bigger_hull_takes_longer_to_cut()
+    {
+        double Took(string hull) { var (w, tug) = AtWork(hull); return (tug.Until - tug.Since) / w.Config.TugWork; }
+        Assert.Equal(0.6, Took("CV_Freighter_SparrowA"), 2);   // small
+        Assert.Equal(1.0, Took(""), 2);                        // unknown hull (a hub post…): mid
+        Assert.Equal(1.8, Took("CV_Freighter_HarkonA"), 2);    // big
+    }
+
+    [Fact]
+    public void Back_from_live_mid_cut_the_wreck_keeps_the_share_and_the_rest_takes_the_rest()
+    {
+        var (w, tug) = AtWork();
+        var now = tug.Until - w.Config.TugWork + 10;
+        tug.Live = "Gulch";
+        w.EndLive(tug.Id, "left", now, 0.6);
+        Assert.Equal(0.6, w.Wrecks["a"].Cut, 3);
+        Assert.Equal(now + 0.4 * w.Config.TugWork, tug.Until, 1);
+        Assert.Equal(0.6, w.TugShare(tug, now), 3);
+        Assert.Equal(0.6, World.Parse(w.Serialize(), out _).Wrecks["a"].Cut, 3);   // saved
+    }
+
+    [Fact]
+    public void A_target_cut_live_is_credited_the_next_comes_then_it_goes_home()
+    {
+        var (w, tug) = AtWork();
+        var now = tug.Until - 100;
+        tug.Live = "Gulch";
+        Assert.True(w.TugCutLive(tug.Id, "a", 1, now));                       // b next
+        Assert.False(w.Wrecks.ContainsKey("a"));
+        Assert.Equal("b", w.TugJob(tug).Id);
+        Assert.Equal(1, w.Stat("eco|tug|cut"));
+        Assert.False(w.TugCutLive(tug.Id, "b", 1, now + 50));                 // list done: home
+        w.EndLive(tug.Id, "left", now + 60);
+        w.Step(now + 61, new Random(3));
+        Assert.Equal("warp", tug.State);
+        Assert.Equal("Port", tug.Dest);
+        Assert.Equal(2, w.Stat("eco|tug|cut"));                               // nothing cut twice
+    }
+
+    [Fact]
+    public void With_a_player_there_it_stands_by_before_cutting()
+    {
+        var w = new World(); w.Config.Systems = new List<string> { "Port" }; w.Config.TugSafeMin = 0;
+        w.SetStations("Port", new List<SimStation> { new SimStation { Id = 1, Name = "Yard", Pos = new LivingSystems.Core.Flight.Vec3(0, 0, 0) } });
+        w.Wrecks["a"] = new SimWreck { Id = "a", System = "Gulch", Name = "A", Kind = "trader", Time = 1, Until = World.Never, Salvage = true };
+        w.Occupied = new HashSet<string> { "Gulch" };
+        var rng = new Random(1);
+        w.LastTick = 100; w.Step(800, rng);
+        var tug = w.Agents.Values.Single(x => x.IsTug);
+        for (var t = 900.0; tug.State != "salvage" && t < 20000; t += 60) w.Step(t, rng);
+        var start = World.WorkStart(tug);
+        Assert.Equal(w.Config.TugStandby + w.Config.TugWork, tug.Until - (start - w.Config.TugStandby), 1);
+        Assert.Equal(0, w.TugShare(tug, start - 60));                        // standing by: nothing cut yet
+        Assert.Equal(0.5, w.TugShare(tug, start + w.Config.TugWork / 2), 2);
+        w.Occupied = new HashSet<string>();                                   // the player left before the countdown ran out
+        var left = start - 300;
+        w.Step(left, rng);
+        Assert.Equal(0, World.WorkStart(tug));
+        Assert.Equal(left + w.Config.TugWork, tug.Until, 1);                 // cutting from now, no standby
+    }
+
+    [Fact]
+    public void A_pile_gets_one_standby_later_trips_just_cut()
+    {
+        foreach (var stood in new[] { false, true })
+        {
+            var w = new World(); w.Config.Systems = new List<string> { "Port" }; w.Config.TugSafeMin = 0;
+            w.SetStations("Port", new List<SimStation> { new SimStation { Id = 1, Name = "Yard", Pos = new LivingSystems.Core.Flight.Vec3(0, 0, 0) } });
+            w.Hubs["h"] = new SimHub { Id = "h", System = "Gulch", Name = "Den", BrokenUntil = 1e9, SalvageAt = 1, StoodBy = stood };
+            w.Wrecks["a"] = new SimWreck { Id = "a", System = "Gulch", Name = "A", Kind = "trader", Time = 1, Until = World.Never, Hub = "h" };
+            w.Occupied = new HashSet<string> { "Gulch" };
+            var rng = new Random(1);
+            w.LastTick = 100; w.Step(800, rng);
+            var tug = w.Agents.Values.Single(x => x.IsTug);
+            for (var t = 900.0; tug.State != "salvage" && t < 20000; t += 60) w.Step(t, rng);
+            Assert.Equal("salvage", tug.State);
+            if (stood) Assert.True(World.WorkStart(tug) <= tug.Since + 1);        // second trip: straight to cutting
+            else { Assert.True(World.WorkStart(tug) >= tug.Since + w.Config.TugStandby - 1); Assert.True(w.Hubs["h"].StoodBy); }
+        }
+    }
+
+    [Fact]
+    public void Crews_talk_about_a_tug_at_work_by_name_and_target()
+    {
+        var (w, tug) = AtWork();
+        var other = w.Add(new SimAgent { Id = "t9", Name = "Gossip", Kind = "trader", System = "Gulch", State = "dock", Until = 1e12 });
+        var said = w.Rumours(other, new List<string>(), w.LastTick, (from, pf) => pf);
+        Assert.Contains(said, r => r.Contains(tug.Name) && r.Contains("the wreck of A") && r.Contains("1 more"));
+    }
+
+    [Fact]
+    public void A_tug_that_finds_its_pile_gone_says_so_and_goes_home()
+    {
+        var w = new World(); w.Config.Systems = new List<string> { "Port" }; w.Config.TugSafeMin = 0;
+        w.SetStations("Port", new List<SimStation> { new SimStation { Id = 1, Name = "Yard", Pos = new LivingSystems.Core.Flight.Vec3(0, 0, 0) } });
+        w.Wrecks["a"] = new SimWreck { Id = "a", System = "Gulch", Name = "A", Kind = "trader", Time = 1, Until = World.Never, Salvage = true };
+        var rng = new Random(1);
+        w.LastTick = 100; w.Step(800, rng);
+        var tug = w.Agents.Values.Single(x => x.IsTug);
+        for (var t = 900.0; tug.State != "warp" && t < 20000; t += 60) w.Step(t, rng);
+        Assert.Equal("Gulch", tug.Dest);
+        w.Wrecks.Remove("a");                                                // a player stripped it meanwhile
+        for (var t = w.LastTick + 60; tug.System != "Gulch" && t < 40000; t += 60) w.Step(t, rng);
+        Assert.Equal("warp", tug.State);
+        Assert.Equal("Port", tug.Dest);
+        Assert.Contains(w.Events, e => e.Kind == "tugbeaten" && e.Agent == tug.Id);
+    }
+
+    [Fact]
+    public void A_full_hold_live_leaves_the_rest_cut_for_the_next_tug()
+    {
+        var (w, tug) = AtWork();
+        var now = tug.Until - 100;
+        tug.Live = "Gulch";
+        Assert.False(w.TugCutLive(tug.Id, "a", 0.7, now));
+        w.EndLive(tug.Id, "left", now + 60);
+        w.Step(now + 61, new Random(3));
+        Assert.Equal("warp", tug.State);
+        Assert.Equal(0.7, w.Wrecks["a"].Cut, 3);
+        Assert.Equal(0, w.Stat("eco|tug|cut"));
+    }
+}
+
+public class TugShipTests
+{
+    static (World w, SimAgent tug) Sent()
+    {
+        var w = new World(); w.Config.Systems = new List<string> { "Port" }; w.Config.TugSafeMin = 0;
+        w.SetStations("Port", new List<SimStation> { new SimStation { Id = 1, Name = "Orbital Refinery", Pos = new LivingSystems.Core.Flight.Vec3(0, 0, 0) },
+                                                    new SimStation { Id = 2, Name = "Repair Yard", Pos = new LivingSystems.Core.Flight.Vec3(5000, 0, 0) } });
+        w.Wrecks["a"] = new SimWreck { Id = "a", System = "Gulch", Name = "A", Kind = "trader", Time = 1, Until = World.Never, Salvage = true };
+        w.LastTick = 100; w.Step(150, new Random(1));                         // the board's first round: sent, still docked
+        return (w, w.Agents.Values.Single(x => x.IsTug));
+    }
+
+    [Fact]
+    public void A_tug_berths_above_or_below_its_yard_out_of_the_lanes()
+    {
+        var (w, tug) = Sent();
+        Assert.Equal(World.TugShip, w.ShipOf(tug, true));
+        Assert.Equal(0, tug.Strength);                                           // unarmed, whatever the hull
+        Assert.Equal("dock", tug.State);
+        Assert.True(w.Track(tug, out var tr));
+        Assert.Equal(2, w.StationOf(tug).Id);                                    // the repair yard
+        Assert.True(Math.Abs(tr.A.Y) >= 400, $"berth y {tr.A.Y}");               // straight up / down (no box: 300 + 120)
+        Assert.Equal(5000, tr.A.X, 1);
+    }
+
+    [Fact]
+    public void Docking_live_sells_the_scrap_and_a_tug_that_flees_live_goes_home()
+    {
+        var (w, tug) = Sent();
+        tug.System = "Port"; tug.State = "in"; tug.Cargo = "SteelPlate"; tug.CargoAmt = 300; tug.Live = "Port"; tug.Until = 1e9;
+        Assert.True(w.DockLive(tug.Id, new Random(1), 2000));
+        Assert.Equal("dock", tug.State);
+        Assert.Equal(0, tug.CargoAmt);
+        Assert.True(w.Stat("eco|tug|sold") > 0);
+        tug.System = "Gulch"; tug.State = "salvage"; tug.Live = "Gulch";
+        w.EndLive(tug.Id, "jumped", 3000);
+        Assert.Equal("warp", tug.State);
+        Assert.Equal("Port", tug.Dest);
+    }
+}
+
+public class TugBoardTests
+{
+    [Fact]
+    public void One_tug_per_site_late_wrecks_join_its_list_and_a_deadly_site_waits()
+    {
+        var w = new World(); w.Config.Systems = new List<string> { "Port" }; w.Config.TugSafeMin = 0;
+        w.SetStations("Port", new List<SimStation> { new SimStation { Id = 1, Name = "Yard", Pos = new LivingSystems.Core.Flight.Vec3(0, 0, 0) } });
+        w.Wrecks["a"] = new SimWreck { Id = "a", System = "Gulch", Name = "A", Kind = "trader", Time = 1, Until = World.Never, Salvage = true };
+        var rng = new Random(1);
+        w.LastTick = 100; w.Step(800, rng);
+        var tug = Assert.Single(w.Agents.Values, x => x.IsTug);
+        w.Wrecks["b"] = new SimWreck { Id = "b", System = "Gulch", Name = "B", Kind = "trader", Time = 2, Until = World.Never, Salvage = true };
+        w.Step(1500, rng);
+        Assert.Single(w.Agents.Values, x => x.IsTug);                     // no second tug for the same site
+        Assert.Equal(tug.Id, w.Wrecks["b"].Tug);                           // the late one joined its list
+        tug.State = "dead"; tug.Until = w.LastTick; tug.System = "Gulch";
+        w.Step(1600, rng);
+        Assert.DoesNotContain(w.Agents.Values, x => x.IsTug);
+        Assert.True(World.Parse(w.Serialize(), out _).TugWary.ContainsKey("Gulch"));   // saved
+        w.Step(1600 + 3 * 3600, rng);                                       // the board skips Gulch for a while
+        Assert.DoesNotContain(w.Agents.Values, x => x.IsTug);
+        w.Step(1600 + 13 * 3600, rng);
+        Assert.Single(w.Agents.Values, x => x.IsTug);                      // then a new one goes
+    }
+}

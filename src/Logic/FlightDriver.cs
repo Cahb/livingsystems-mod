@@ -25,7 +25,7 @@ namespace LivingSystems
     ///   idle auto|brake|coast            what to send when the controller wants ~0 accel
     /// Push gains are learned per ship and direction (<see cref="ResponseEstimator"/>); no manual gain.
     /// </summary>
-    sealed class FlightDriver
+    sealed partial class FlightDriver
     {
         readonly IModApi api;
         readonly Action<string> log;
@@ -43,6 +43,7 @@ namespace LivingSystems
             public double NextLog;
             public Vector3 AccelSum; public int AccelN;   // measured local accel, averaged per log line
             public Vector3 PushSum;                        // commanded local accel, same window
+            public float LiftDuty;                         // pinned hulls: lift key pulse accumulator
             public Vector3 FrameAccel;                     // measured local accel over the last frame
             public Vec3 LastThrottle;                      // throttle in effect since last frame (Move persists), each axis −1…1
             public float MassKg = -1; public double MassAt = -1;
@@ -69,6 +70,7 @@ namespace LivingSystems
             public float Distance = 150f, Cruise = 40f;
             public Vector3 HoldAt;       // hold: the spot to keep
             public Vector3 WaitAt; public bool Waiting;   // follow with the leader away: hold here until they're back
+            public bool Face; public Vector3 FaceAt;      // hold / goto: once there, keep the nose on this point (aimed work)
         }
         readonly Dictionary<int, Order> orders = new Dictionary<int, Order>();
 
@@ -86,6 +88,9 @@ namespace LivingSystems
         /// «LS» name — a player can rename their own ship to «LS» (we must never fly or destroy it) or rename ours.
         /// </summary>
         readonly HashSet<int> known = new HashSet<int>();
+        /// <summary>When a ship of ours was first seen player-owned (the claim check waits <see cref="ClaimGrace"/> s).</summary>
+        readonly Dictionary<int, double> firstKnown = new Dictionary<int, double>();
+        const double ClaimGrace = 30;
         /// <summary>«LS»-named structures that are NOT registered, already logged once.</summary>
         readonly HashSet<int> impostors = new HashSet<int>();
 
@@ -305,8 +310,8 @@ namespace LivingSystems
             if (orders.Remove(shipId)) Persist(shipId, null);
             stored.Remove(shipId);
             if (factionOrig.ContainsKey(shipId)) GiveOrder(pid, shipId, "leave", 0);
-            ToDedi("regpatch", ShipRecord.BuildLine(new Dictionary<string, string>
-                { ["id"] = shipId.ToString(CultureInfo.InvariantCulture), ["memory.hostile." + key] = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture) }));
+            // through Remember: the registry AND the sim's agent (a sim trader's crew retells it — word of mouth)
+            Remember(shipId, "memory.hostile." + key, DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture));
             log($"FLY hostility: {pid} ({key}) destroyed a block on {shipId} '{e.Name}' — order dropped, fleeing");
             Event($"{N(e)} attacked by {(pl != null ? S(() => pl.Name) : "someone")} — fleeing");
             reply(pid, $"{StructureTag.Strip(e.Name)}: You're shooting at us! We're out.");
@@ -382,7 +387,98 @@ namespace LivingSystems
         }
 
         /// <summary>Order given or released (null): full update of the ship's record.</summary>
-        void Persist(int shipId, Order o) => ToDedi("regset", ShipRecord.ToLine(RecordOf(shipId, o)));
+        void Persist(int shipId, Order o) { if (!transient.Contains(shipId)) ToDedi("regset", ShipRecord.ToLine(RecordOf(shipId, o))); }
+
+        /// <summary>Ships flown without a registry record (test hulls): they take orders, nothing is saved for them.</summary>
+        readonly HashSet<int> transient = new HashSet<int>();
+
+        /// <summary>
+        /// Ships whose origin (the point the game turns them round, their HUD mark) sits far off their blocks — some Eden
+        /// blueprints keep it metres outside the hull: the offset from the origin to the hull's middle, in the ship's frame.
+        /// For these the driver steers the hull's middle, and every turn is shifted back so the middle stays put (turning
+        /// round the far-off origin swept the whole hull sideways: the salvage tug spun and wobbled).
+        /// </summary>
+        readonly Dictionary<int, Vector3> pivots = new Dictionary<int, Vector3>();
+        readonly Dictionary<int, Quaternion> pivotRot = new Dictionary<int, Quaternion>();
+        public void SetPivot(int shipId, Vector3 local) { if (local.magnitude < 1f) pivots.Remove(shipId); else pivots[shipId] = local; pivotRot.Remove(shipId); diag.Remove(shipId); }
+        /// <summary>off = steer by the origin (as every ship) · measure = by the hull's middle · unswing = by the middle, and
+        /// each turn shifted back so the middle stays put. A test switch: which one flies a far-off-origin hull right.</summary>
+        public string PivotMode = "off";
+        /// <summary>Per-ship turn-rate cap (deg/s): the game doesn't limit turns (we set the rotation), so a ship that must
+        /// turn gently — a tug easing its beam onto each cut — gets its own.</summary>
+        readonly Dictionary<int, float> turnCaps = new Dictionary<int, float>();
+        public void SetTurnCap(int shipId, float degPerSec) { if (degPerSec > 0) turnCaps[shipId] = degPerSec; else turnCaps.Remove(shipId); }
+        /// <summary>Thrust cap (m/s², every direction) for a light hull: the velocity loop (τ 0.4 s, tuned on 757 t freighters)
+        /// overshoots on a ship that can actually deliver what it asks for — reads as wobbling back and forth.</summary>
+        readonly Dictionary<int, float> accelCaps = new Dictionary<int, float>();
+        public void SetAccelCap(int shipId, float mps2) { if (mps2 > 0) accelCaps[shipId] = mps2; else accelCaps.Remove(shipId); thrustPins.Remove(shipId); }
+        /// <summary>Known full thrust per ship (forward, back, up, down, right, left — m/s²): used as is, never learned.</summary>
+        readonly Dictionary<int, float[]> thrustPins = new Dictionary<int, float[]>();
+        public void PinThrust(int shipId, float[] fbudrl) { if (fbudrl != null && fbudrl.Length == 6) thrustPins[shipId] = fbudrl; else thrustPins.Remove(shipId); }   // seen 2026-11-17: off flies the tugboat steadiest (the game turns ships round their origin)
+
+        /// <summary>
+        /// Which point does the game turn a ship round when we set its rotation? Each frame: how far the origin and the hull's
+        /// middle moved, and how far the middle WOULD move if the turn went round the origin (the sweep). Logged per second:
+        /// middle ≈ sweep and origin ≈ 0 → round the origin; origin ≈ sweep and middle ≈ 0 → round its middle / mass.
+        /// </summary>
+        sealed class PivotSample { public Vector3 Pos, Mid; public Quaternion Rot; public bool Has; public float Turn, Origin, Middle, Sweep; public int N; public double Next; }
+        readonly Dictionary<int, PivotSample> diag = new Dictionary<int, PivotSample>();
+        void PivotDiag(IEntity e)
+        {
+            if (PivotMode == "off" || !pivots.TryGetValue(e.Id, out var off)) return;   // the diagnostic runs only while testing a mode
+            if (!diag.TryGetValue(e.Id, out var d)) diag[e.Id] = d = new PivotSample { Next = Now + 1 };
+            var pos = e.Position; var rot = e.Rotation; var mid = pos + rot * off;
+            if (d.Has)
+            {
+                d.Turn += Quaternion.Angle(d.Rot, rot);
+                d.Origin += (pos - d.Pos).magnitude;
+                d.Middle += (mid - d.Mid).magnitude;
+                d.Sweep += (rot * off - d.Rot * off).magnitude;
+                d.N++;
+            }
+            d.Pos = pos; d.Rot = rot; d.Mid = mid; d.Has = true;
+            if (Now < d.Next) return;
+            d.Next = Now + 1;
+            var verdict = d.Turn < 0.5f ? "hardly turning" : Math.Abs(d.Middle - d.Sweep) < Math.Abs(d.Origin - d.Sweep) ? "middle swept: turns ROUND THE ORIGIN" : "origin swept: turns ROUND ITS MIDDLE";
+            log($"PIVOT {e.Id} [{PivotMode}] 1 s ({d.N} frames): turned {d.Turn:0.0}°, origin moved {d.Origin:0.00} m, middle moved {d.Middle:0.00} m, sweep if round the origin {d.Sweep:0.00} m — {verdict}");
+            d.Turn = d.Origin = d.Middle = d.Sweep = 0; d.N = 0;
+        }
+        /// <summary>Where the driver says the ship is: its hull's middle if it has a pivot, else the game's position.</summary>
+        public Vector3 CentreOf(IEntity e) => e == null ? Vector3.zero : PivotMode != "off" && pivots.TryGetValue(e.Id, out var off) ? e.Position + e.Rotation * off : e.Position;
+        /// <summary>Undo the sweep of the last frame's turn (the game turned it round its origin; we want its middle still).</summary>
+        void Unswing(IEntity e)
+        {
+            if (!pivots.TryGetValue(e.Id, out var off)) return;
+            var rot = e.Rotation;
+            if (pivotRot.TryGetValue(e.Id, out var was))
+            {
+                var d = rot * off - was * off;
+                if (d.sqrMagnitude > 1e-4f) Safe(() => e.Position = e.Position - d);
+            }
+            pivotRot[e.Id] = rot;
+        }
+
+        /// <summary>Fly a hull we spawned for a test without registering it (it's gone with the next retire / restart).</summary>
+        public void Adopt(int shipId) { known.Add(shipId); transient.Add(shipId); }
+
+        /// <summary>Move its hold point (a short creep — a goto under the hold radius counts as arrived at once); the aim
+        /// it had stays. False if not ours.</summary>
+        public bool MoveHold(int shipId, Vector3 spot)
+        {
+            if (playfield?.Entities == null || !playfield.Entities.TryGetValue(shipId, out var e) || e == null || !known.Contains(shipId)) return false;
+            orders.TryGetValue(shipId, out var old);
+            orders[shipId] = new Order { Kind = "hold", HoldAt = spot, Cruise = 20f, Face = old != null && old.Face, FaceAt = old != null ? old.FaceAt : Vector3.zero };
+            return true;
+        }
+
+        /// <summary>Hold where it is (or where its trip ends) with the nose on <paramref name="point"/>. False if not ours.</summary>
+        public bool Aim(int shipId, Vector3 point)
+        {
+            if (playfield?.Entities == null || !playfield.Entities.TryGetValue(shipId, out var e) || e == null || !known.Contains(shipId)) return false;
+            if (!orders.TryGetValue(shipId, out var o) || (o.Kind != "hold" && o.Kind != "goto")) orders[shipId] = o = new Order { Kind = "hold", HoldAt = e.Position, Cruise = 20f };
+            o.Face = true; o.FaceAt = point;
+            return true;
+        }
 
         /// <summary>
         /// «LS» name but not registered. A player's ship (renamed) is never touched. NPC-owned with a live core = a copy of
@@ -560,6 +656,9 @@ namespace LivingSystems
         }
 
         /// <summary>Give one ship an order; returns the ship's reply line, or null if it isn't ours / isn't here.</summary>
+        /// <summary>A player's order to one of our ships (follow / hold / …) from code (demo commands). Null if not ours.</summary>
+        public string Command(int pid, int shipId, string kind, float distance) => GiveOrder(pid, shipId, kind, distance);
+
         string GiveOrder(int pid, int shipId, string kind, float distance)
         {
             if (playfield?.Entities == null || !playfield.Entities.TryGetValue(shipId, out var e) || e?.Structure == null || !known.Contains(shipId))
@@ -707,6 +806,10 @@ namespace LivingSystems
         void CheckClaimed(IEntity e)
         {
             if (factionOrig.ContainsKey(e.Id) || !Factions.IsPlayer((int)e.Faction.Group)) return;
+            // a fresh spawn can come up player-owned from its blueprint (the Eden "free" tugboat): its owner sets the
+            // faction in its first seconds — nobody claims a ship that young
+            if (!firstKnown.TryGetValue(e.Id, out var since)) firstKnown[e.Id] = since = Now;
+            if (Now - since < ClaimGrace) return;
             var id = e.Id;
             if (orders.ContainsKey(id) || fleeing.ContainsKey(id)) Safe(() => e.Move(Vector3.zero));
             combatants.Remove(id); known.Remove(id); orders.Remove(id); stored.Remove(id); fleeing.Remove(id); warp.Remove(id); startBlocks.Remove(id); tracks.Remove(id);
@@ -731,7 +834,17 @@ namespace LivingSystems
             if (combatants.Contains(e.Id)) return;
             var core = S(() => e.Structure.CoreType);
             if (core != "None") { if (!core.StartsWith("!")) seenAlive.Add(e.Id); return; }
-            if (!seenAlive.Contains(e.Id) || !dead.Add(e.Id)) return;
+            if (!seenAlive.Contains(e.Id))
+            {   // loaded already dead (killed before this session): a hull now — drop its order, or rotation (no power needed) keeps
+                // turning it every frame, and a tug cutting it shifts its centre (it spun)
+                if (S(() => e.Structure.IsReady) != "True" || !orders.ContainsKey(e.Id)) return;
+                Safe(() => e.Move(Vector3.zero));
+                orders.Remove(e.Id); stored.Remove(e.Id); fleeing.Remove(e.Id); warp.Remove(e.Id); detours.Remove(e.Id);
+                Persist(e.Id, null);
+                log($"FLY {e.Id} '{e.Name}': loaded without a core — a hull, not flown any more");
+                return;
+            }
+            if (!dead.Add(e.Id)) return;
             Safe(() => e.Move(Vector3.zero));
             orders.Remove(e.Id); stored.Remove(e.Id); fleeing.Remove(e.Id); warp.Remove(e.Id); factionOrig.Remove(e.Id);
             known.Remove(e.Id);
@@ -793,9 +906,10 @@ namespace LivingSystems
         /// </summary>
         public void Retire(int shipId)
         {
+            pivots.Remove(shipId); pivotRot.Remove(shipId); diag.Remove(shipId); turnCaps.Remove(shipId); accelCaps.Remove(shipId);
             orders.Remove(shipId); stored.Remove(shipId); fleeing.Remove(shipId); warp.Remove(shipId); combatants.Remove(shipId);
             known.Remove(shipId); factionOrig.Remove(shipId);
-            Unpersist(shipId);
+            if (!transient.Remove(shipId)) Unpersist(shipId);
             ToDedi("destroy", 0, shipId);
             log($"FLY {shipId}: retired to the sim");
         }
@@ -945,6 +1059,19 @@ namespace LivingSystems
                 case "prefab":  // test: cycle through candidate hulls 300 m ahead (/ls fly prefab traders|pirates|wrecks|next|prev|<name>|clear)
                     if (Prefab != null) Prefab(pid, args.Skip(1).ToArray());
                     break;
+                case "hire":    // a hired salvage tug (orders from the hail menu: /ls fly hire start|follow|stay|cut <id>|clear|hold|took|dismiss)
+                    if (Prefab != null) Prefab(pid, new[] { "hire" }.Concat(args.Skip(1)).ToArray());
+                    break;
+                case "tug":     // demo: a salvage tug of your own (/ls fly tug spawn|follow|wreck [id]|stop|clear)
+                    if (Prefab != null) Prefab(pid, new[] { "tug" }.Concat(args.Skip(1)).ToArray());
+                    break;
+                case "pivot":   // test: how ships with a far-off origin are steered (/ls fly pivot off|measure|unswing)
+                {
+                    var m = args.Length > 1 ? args[1] : "";
+                    if (m == "off" || m == "measure" || m == "unswing") { PivotMode = m; reply(pid, $"pivot mode: {m} — log lines 'PIVOT' each second while a pivoted ship flies"); }
+                    else reply(pid, $"pivot mode is {PivotMode} ({pivots.Count} ship(s) with a far-off origin). /ls fly pivot off|measure|unswing");
+                    break;
+                }
                 case "patrol":  // test: call a station patrol onto the nearest live pirate attack right now
                     if (Patrol != null) Patrol(pid);
                     break;
@@ -1057,6 +1184,7 @@ namespace LivingSystems
             var dt = (float)(now - lastTick);
             lastTick = now;
             if (playfield == null || dt <= 0f || dt > 1f) return;
+            if (tows.Count > 0) StepTows(dt);
             if (probeArmed) Probe(now, dt);
             if (now >= nextSeenScan)
             {
@@ -1111,7 +1239,10 @@ namespace LivingSystems
                 Order order;
                 if (isFleeing) order = new Order { Kind = "flee", Cruise = float.MaxValue };   // flat out: GoTo caps it at the ship's max speed
                 else if (!orders.TryGetValue(e.Id, out order)) continue;
-                var t = Measure(e.Id, e.Position, e.Rotation, dt);
+                PivotDiag(e);
+                if (PivotMode == "unswing") Unswing(e);
+                var here = PivotMode == "off" ? e.Position : CentreOf(e);
+                var t = Measure(e.Id, here, e.Rotation, dt);
                 if (!t.HasVel) continue;
                 if (t.HasRotSet) t.RotDrift = Math.Max(t.RotDrift, Quaternion.Angle(t.RotSet, e.Rotation));
                 // The game eases a set Rotation in over several frames (measured: real turn ≈ ¼ of commanded when we
@@ -1123,7 +1254,20 @@ namespace LivingSystems
                     log($"FLY {e.Id} response {t.LoggedState} -> {t.Response.State} caps(f/b/u/d/r/l)={Caps(t)}");
                     t.LoggedState = t.Response.State;
                 }
+                if (!t.Response.Pinned && thrustPins.TryGetValue(e.Id, out var pin)) { t.Response.Pin(pin[0], pin[1], pin[2], pin[3], pin[4], pin[5]); log($"FLY {e.Id} thrust pinned f/b/u/d/r/l={string.Join("/", pin.Select(x => x.ToString("0.#", CultureInfo.InvariantCulture)))}"); }
                 var caps = t.Response.Caps(MassOf(e, t, now));
+                var detouring = detours.TryGetValue(e.Id, out var dt0) && dt0.Has;   // flying round something: its normal turn rate, not the slow aiming one
+                if (!detouring && turnCaps.TryGetValue(e.Id, out var tc))
+                {   // a heavy, deliberate turner (salvage tugs aiming their beam): slow rates, gentle ease-in
+                    caps.TurnPitch = Math.Min(caps.TurnPitch, tc); caps.TurnYaw = Math.Min(caps.TurnYaw, tc); caps.TurnRoll = Math.Min(caps.TurnRoll, tc);
+                    caps.TurnAccel = Math.Min(caps.TurnAccel, tc * 1.5f);
+                }
+                if (accelCaps.TryGetValue(e.Id, out var ac))
+                {
+                    caps.AccelForward = Math.Min(caps.AccelForward, ac); caps.AccelBack = Math.Min(caps.AccelBack, ac);
+                    caps.AccelUp = Math.Min(caps.AccelUp, ac); caps.AccelDown = Math.Min(caps.AccelDown, ac);
+                    caps.AccelRight = Math.Min(caps.AccelRight, ac); caps.AccelLeft = Math.Min(caps.AccelLeft, ac);
+                }
                 FlightCommand cmd;
                 var dist = 0f;
                 if (isFleeing)
@@ -1142,21 +1286,34 @@ namespace LivingSystems
                     dist = (lead.Position - e.Position).magnitude;
                 }
                 else if (order.Kind == "hold")
-                    cmd = Behaviours.HoldAt(t.State, caps, V(order.HoldAt), order.Cruise);
+                {
+                    var bkh = Unstick(e, here, order.HoldAt, now, out var jumpedH);
+                    if (jumpedH) continue;
+                    var wph = bkh ?? Detoured(e, here, order.HoldAt, now);
+                    // a hold far off (tug to the next wreck) round what's in the way: nose to the waypoint, main thrust —
+                    // facing the work meanwhile slid it on weak lift/strafe thrust
+                    cmd = wph.HasValue ? Behaviours.GoTo(t.State, caps, V(wph.Value), 0f, order.Cruise) : Behaviours.HoldAt(t.State, caps, V(order.HoldAt), order.Cruise);
+                    if (order.Face && !wph.HasValue) cmd.DesiredRot = Behaviours.Facing(t.State, V(order.FaceAt - here));
+                }
                 else if (order.Kind == "goto")
                 {
-                    dist = (order.HoldAt - e.Position).magnitude;
+                    dist = (order.HoldAt - here).magnitude;
                     if (dist <= order.Distance + 100f)
                     {
                         // arrived: hold here (the trip is over; the escort run sees "arrived" by distance)
-                        var held = new Order { Kind = "hold", HoldAt = e.Position };
+                        var held = new Order { Kind = "hold", HoldAt = here, Face = order.Face, FaceAt = order.FaceAt };
                         orders[e.Id] = held; Persist(e.Id, held);
                         log($"FLY {e.Id} '{e.Name}': arrived at '{order.LeaderName}'");
                         Event($"{N(e)} arrived at {order.LeaderName}");
                         order = held;
                         cmd = Behaviours.HoldAt(t.State, caps, V(held.HoldAt), held.Cruise);
                     }
-                    else cmd = Behaviours.GoTo(t.State, caps, V(order.HoldAt), order.Distance, order.Cruise);
+                    else if (Unstick(e, here, order.HoldAt, now, out var jumpedG) is Vector3 bkg)
+                        cmd = Behaviours.GoTo(t.State, caps, V(bkg), 0f, order.Cruise);
+                    else if (jumpedG) continue;
+                    else cmd = Detoured(e, here, order.HoldAt, now) is Vector3 wpg
+                        ? Behaviours.GoTo(t.State, caps, V(wpg), 0f, order.Cruise)
+                        : Behaviours.GoTo(t.State, caps, V(order.HoldAt), order.Distance, order.Cruise);
                 }
                 else if (order.Kind == "intercept" && playfield.Entities.TryGetValue(order.TargetId, out var tgt) && tgt != null)
                 {
@@ -1234,7 +1391,8 @@ namespace LivingSystems
         {
             if (localAccel.Length < 0.05f)
             {
-                var brake = idle == "brake" || (idle == "auto" && wantStop);
+                // known thrust (pinned): no hard brake — the game's brake is ~12 m/s² flat, every tiny drift a jolt
+                var brake = !t.Response.Pinned && (idle == "brake" || (idle == "auto" && wantStop));
                 if (brake) { e.Move(Vector3.zero); return Vec3.Zero; }
                 // coast: a negligible FORWARD throttle (any value on an on/off axis would be full sideways thrust)
                 e.Move(new Vector3(0f, 0f, 0.01f));
@@ -1249,7 +1407,15 @@ namespace LivingSystems
             var th = t.Response.ThrottleFor(localAccel);
             // on/off key decided against the cautious planning estimate: against the high throttle guess a wanted
             // 6 m/s² read as 20 % and the lift key was never pressed (up/down stayed unlearned all run)
-            th = new Vec3(th.X, Key(t.Response.FractionOfPlanned(localAccel).Y), th.Z);
+            var up = t.Response.FractionOfPlanned(localAccel).Y;
+            if (t.Response.Pinned)
+            {   // known (strong) lift: pulse the on/off key so it averages what's wanted — a full kick per small correction bobs
+                t.LiftDuty += up;
+                var key = t.LiftDuty >= 0.5f ? 1f : t.LiftDuty <= -0.5f ? -1f : 0f;
+                t.LiftDuty = Math.Max(-1f, Math.Min(1f, t.LiftDuty - key));
+                th = new Vec3(th.X, key, th.Z);
+            }
+            else th = new Vec3(th.X, Key(up), th.Z);
             e.Move(new Vector3(th.X * ThrottleScale, th.Y, th.Z * ThrottleScale));
             return th;
         }

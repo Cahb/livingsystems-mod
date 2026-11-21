@@ -55,4 +55,31 @@ public class ShipTests
         var back = World.Parse(w.Serialize(), out _).Wrecks[wr.Id];
         Assert.Equal(wr.Ship, back.Ship); Assert.True(back.Looted);
     }
+
+    [Fact]
+    public void LiveDeathHullIsOwedItsCashOnce()
+    {
+        var hull = new SimWreck { Id = "w1", Entity = 42, Cash = 35000 };
+        Assert.True(World.CashOwed(hull));                                                          // a live death: never spawned by us
+        Assert.False(World.CashOwed(new SimWreck { Id = "w2", Entity = 42, Cash = 35000, Shown = "wreck" }));   // spawned: wreckfill had it
+        Assert.False(World.CashOwed(new SimWreck { Id = "w3", Entity = 42, Cash = 35000, Hub = "h1" }));        // hauled home
+        Assert.False(World.CashOwed(new SimWreck { Id = "w4", Entity = 0, Cash = 35000 }));                     // no hull yet
+        var w = new World(); w.Wrecks[hull.Id] = hull;
+        hull.CashAboard = true;
+        var back = World.Parse(w.Serialize(), out _).Wrecks["w1"];
+        Assert.True(back.CashAboard); Assert.False(World.CashOwed(back));                           // delivered: never twice
+    }
+
+    [Fact]
+    public void A_stack_with_its_own_data_keeps_it_through_the_hold()
+    {
+        Assert.Equal("SteelPlate", World.StackKey("SteelPlate", 0, 0));
+        var k = World.StackKey("Token", 1011, 0);
+        Assert.Equal("Token", World.KeyBase(k, out var ammo, out var decay));
+        Assert.Equal(1011, ammo); Assert.Equal(0, decay);
+        var hold = World.ParseHold(World.FormatHold(new Dictionary<string, int> { [k] = 1, [World.StackKey("Token", 1234, 0)] = 1, ["SteelPlate"] = 5 }));
+        Assert.Equal(3, hold.Count);                                    // two tokens stay two different things
+        Assert.Equal("Token", World.Humanize(k).Length > 0 ? World.KeyBase(k, out _, out _) : "");
+        Assert.Equal(World.Value("SteelPlate", 1), World.Value(World.StackKey("SteelPlate", 0, 7), 1));   // priced by the item
+    }
 }
